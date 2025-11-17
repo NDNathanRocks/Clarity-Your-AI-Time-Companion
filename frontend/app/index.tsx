@@ -12,6 +12,7 @@ import {
   FlatList,
   RefreshControl,
   Platform,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -29,9 +30,12 @@ import EditTaskModal from './components/EditTaskModal';
 
 // Use your laptop's IP address for mobile devices to connect
 // Change this to your laptop's local IP (run 'ipconfig' on Windows or 'ifconfig' on Mac)
+// For iOS Simulator, use localhost. For physical devices, use your computer's IP
 const API_BASE_URL = Platform.OS === 'web' 
   ? 'http://localhost:8000/api'
-  : 'http://172.16.82.137:8000/api';  // Your laptop's local IP
+  : Platform.OS === 'ios'
+    ? 'http://172.16.208.98:8000/api'  // iOS Simulator can use localhost
+    : 'http://172.16.208.98:8000/api';  // Android/Physical devices need your laptop's IP
 
 console.log('[CONFIG] API Base URL:', API_BASE_URL);
 console.log('[CONFIG] Platform:', Platform.OS);
@@ -39,7 +43,7 @@ console.log('[CONFIG] Platform:', Platform.OS);
 // Configure axios
 const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 10000,
+  timeout: 30000, // Increased to 30 seconds for slower connections
   headers: {
     'Content-Type': 'application/json',
   },
@@ -2581,7 +2585,11 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
   }
 
   return (
-    <View style={styles.chatContainer}>
+    <KeyboardAvoidingView 
+      style={styles.chatContainer}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+    >
       <FlatList
         data={messages}
         keyExtractor={(item) => item.id}
@@ -2611,6 +2619,9 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
           placeholder="Ask Clarity anything..."
           value={inputText}
           onChangeText={setInputText}
+          onSubmitEditing={handleSend}
+          returnKeyType="send"
+          blurOnSubmit={false}
           multiline
         />
         <TouchableOpacity
@@ -2625,7 +2636,7 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
           )}
         </TouchableOpacity>
       </View>
-    </View>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -3369,6 +3380,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 15,
     paddingVertical: 10,
     fontSize: 16,
+    marginRight: 10,
+  },
+  micButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#6366f1',
+    justifyContent: 'center',
+    alignItems: 'center',
     marginRight: 10,
   },
   sendButton: {
