@@ -47,15 +47,35 @@ class TaskSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'parent_task', 'title', 'description', 'due_date', 
             'estimated_duration_minutes', 'ai_friendly_message',
-            'status', 'priority', 'location', 'subtasks', 'created_at', 'updated_at', 'completed_at',
+            'status', 'priority', 'location', 'order', 'subtasks', 'created_at', 'updated_at', 'completed_at',
             'scheduled_date', 'scheduled_time', 'calendar_event_id'
         ]
         read_only_fields = ['created_at', 'updated_at', 'completed_at']
     
+    def update(self, instance, validated_data):
+        """Override update to set completed_at when status changes to done"""
+        from django.utils import timezone
+        
+        # Check if status is changing to 'done'
+        new_status = validated_data.get('status', instance.status)
+        if new_status == 'done' and instance.status != 'done':
+            # Task is being marked as complete
+            instance.completed_at = timezone.now()
+        elif new_status != 'done' and instance.status == 'done':
+            # Task is being unmarked as complete
+            instance.completed_at = None
+        
+        # Update all other fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        
+        instance.save()
+        return instance
+    
     def get_subtasks(self, obj):
-        # Return subtasks if this is a parent task
+        # Return subtasks if this is a parent task, ordered by order field (then created_at as fallback)
         if obj.subtasks.exists():
-            return TaskSerializer(obj.subtasks.all(), many=True).data
+            return TaskSerializer(obj.subtasks.all().order_by('order', 'created_at'), many=True).data
         return []
 
 

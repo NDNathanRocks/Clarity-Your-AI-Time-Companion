@@ -8,11 +8,14 @@ import {
   StyleSheet,
   ScrollView,
   Alert,
-  Platform
+  Platform,
+  KeyboardAvoidingView
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { API_BASE_URL } from '../config';
 
 // Pastel color scheme for priorities
 const PRIORITY_COLORS = {
@@ -55,8 +58,11 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
   const [priority, setPriority] = useState<'low' | 'medium' | 'high'>('medium');
   const [location, setLocation] = useState('');
   const [duration, setDuration] = useState(60);
-  const [scheduledDate, setScheduledDate] = useState('');
-  const [scheduledTime, setScheduledTime] = useState('');
+  const [isScheduled, setIsScheduled] = useState(false);
+  const [selectedDate, setSelectedDate] = useState(new Date());
+  const [selectedTime, setSelectedTime] = useState(new Date());
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
   const [subtasks, setSubtasks] = useState<Subtask[]>([]);
   const [loading, setLoading] = useState(false);
   const [locationPermissionGranted, setLocationPermissionGranted] = useState(false);
@@ -68,8 +74,19 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
       setPriority(task.priority || 'medium');
       setLocation(task.location || '');
       setDuration(task.estimated_duration_minutes || 60);
-      setScheduledDate(task.scheduled_date || '');
-      setScheduledTime(task.scheduled_time || '');
+      
+      // Handle scheduling
+      if (task.scheduled_date && task.scheduled_time) {
+        setIsScheduled(true);
+        const dateTime = new Date(`${task.scheduled_date}T${task.scheduled_time}`);
+        setSelectedDate(dateTime);
+        setSelectedTime(dateTime);
+      } else {
+        setIsScheduled(false);
+        setSelectedDate(new Date());
+        setSelectedTime(new Date());
+      }
+      
       setSubtasks(task.subtasks || []);
     }
   }, [task, visible]);
@@ -125,22 +142,68 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
     }
   };
 
+  const formatDateForDisplay = (date: Date): string => {
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = date.toLocaleDateString('en-US', { month: 'short' });
+    return `${day} ${month}`;
+  };
+
+  const formatTimeForDisplay = (date: Date): string => {
+    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  };
+
+  const roundToNearest15 = (date: Date): Date => {
+    const minutes = date.getMinutes();
+    const roundedMinutes = Math.round(minutes / 15) * 15;
+    const newDate = new Date(date);
+    newDate.setMinutes(roundedMinutes);
+    newDate.setSeconds(0);
+    newDate.setMilliseconds(0);
+    return newDate;
+  };
+
+  // Calculate total duration from subtasks
+  const calculateTotalDuration = (subtaskList: Subtask[]) => {
+    if (subtaskList.length === 0) return duration; // Keep current duration if no subtasks
+    return subtaskList.reduce((total, st) => total + st.estimated_duration_minutes, 0);
+  };
+
   const handleAddSubtask = () => {
-    setSubtasks([...subtasks, { title: '', estimated_duration_minutes: 30 }]);
+    const updated = [...subtasks, { title: '', estimated_duration_minutes: 30 }];
+    setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   const handleAddBreak = () => {
-    setSubtasks([...subtasks, { title: 'Break', estimated_duration_minutes: 15, description: 'Take a break', isBreak: true }]);
+    const updated = [...subtasks, { title: 'Break', estimated_duration_minutes: 15, description: 'Take a break', isBreak: true }];
+    setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   const handleUpdateSubtask = (index: number, field: keyof Subtask, value: any) => {
     const updated = [...subtasks];
     updated[index] = { ...updated[index], [field]: value };
     setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   const handleDeleteSubtask = (index: number) => {
     const updated = subtasks.filter((_, i) => i !== index);
+    setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
+  };
+
+  const handleMoveSubtaskUp = (index: number) => {
+    if (index === 0) return;
+    const updated = [...subtasks];
+    [updated[index - 1], updated[index]] = [updated[index], updated[index - 1]];
+    setSubtasks(updated);
+  };
+
+  const handleMoveSubtaskDown = (index: number) => {
+    if (index === subtasks.length - 1) return;
+    const updated = [...subtasks];
+    [updated[index], updated[index + 1]] = [updated[index + 1], updated[index]];
     setSubtasks(updated);
   };
 
@@ -156,26 +219,41 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
 
     try {
       const token = await AsyncStorage.getItem('authToken');
-      const API_BASE_URL = Platform.OS === 'web' 
-        ? 'http://localhost:8000/api'
-        : 'http://172.16.82.137:8000/api';
+
+      // Format date and time if scheduled
+      let dateStr = '';
+      let timeStr = '';
+      
+      if (isScheduled) {
+        const year = selectedDate.getFullYear();
+        const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
+        const day = String(selectedDate.getDate()).padStart(2, '0');
+        dateStr = `${year}-${month}-${day}`;
+        
+        const hours = String(selectedTime.getHours()).padStart(2, '0');
+        const minutes = String(selectedTime.getMinutes()).padStart(2, '0');
+        timeStr = `${hours}:${minutes}`;
+      }
 
       // Update main task
       const taskData: any = {
         title: title.trim(),
         description: description.trim(),
-        estimated_minutes: duration,
+        estimated_duration_minutes: duration,
         priority,
         location: location.trim() || null,
       };
 
-      if (scheduledDate && scheduledTime) {
-        taskData.scheduled_date = scheduledDate;
-        taskData.scheduled_time = scheduledTime;
+      if (isScheduled && dateStr && timeStr) {
+        taskData.scheduled_date = dateStr;
+        taskData.scheduled_time = timeStr;
+      } else {
+        taskData.scheduled_date = null;
+        taskData.scheduled_time = null;
       }
 
       const response = await fetch(`${API_BASE_URL}/tasks/${task.id}/`, {
-        method: 'POST',
+        method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Token ${token}`,
@@ -188,57 +266,68 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
         throw new Error(errorData.error || 'Failed to update task');
       }
 
-      // Update subtasks if any
-      if (subtasks.length > 0) {
-        // Delete removed subtasks
-        const existingSubtaskIds = task.subtasks?.map(st => st.id).filter(id => id !== undefined) || [];
-        const currentSubtaskIds = subtasks.map(st => st.id).filter(id => id !== undefined);
-        const deletedIds = existingSubtaskIds.filter(id => !currentSubtaskIds.includes(id));
+      // Delete removed subtasks
+      const existingSubtaskIds = task.subtasks?.map(st => st.id).filter(id => id !== undefined) || [];
+      const currentSubtaskIds = subtasks.map(st => st.id).filter(id => id !== undefined);
+      const deletedIds = existingSubtaskIds.filter(id => !currentSubtaskIds.includes(id));
 
-        for (const id of deletedIds) {
-          await fetch(`${API_BASE_URL}/tasks/${id}/delete/`, {
-            method: 'DELETE',
-            headers: {
-              'Authorization': `Token ${token}`,
-            },
-          });
-        }
+      for (const id of deletedIds) {
+        await fetch(`${API_BASE_URL}/tasks/${id}/delete/`, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Token ${token}`,
+          },
+        });
+      }
 
-        // Update or create subtasks
-        for (let i = 0; i < subtasks.length; i++) {
-          const subtask = subtasks[i];
+      // Update or create subtasks with proper parent_task relationship
+      for (let i = 0; i < subtasks.length; i++) {
+        const subtask = subtasks[i];
+        
+        if (subtask.id) {
+          // Update existing subtask - use PUT to update all fields including order
           const subtaskData = {
             title: subtask.title,
             description: subtask.description || '',
             estimated_duration_minutes: subtask.estimated_duration_minutes,
             parent_task: task.id,
             order: i,
+            status: 'pending', // Keep subtasks as pending
           };
 
-          if (subtask.id) {
-            // Update existing subtask
-            await fetch(`${API_BASE_URL}/tasks/${subtask.id}/`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Token ${token}`,
-              },
-              body: JSON.stringify(subtaskData),
-            });
-          } else {
-            // Create new subtask
-            await fetch(`${API_BASE_URL}/tasks/create/`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Token ${token}`,
-              },
-              body: JSON.stringify({
-                ...subtaskData,
-                ai_message: '',
-                subtasks: [],
-              }),
-            });
+          await fetch(`${API_BASE_URL}/tasks/${subtask.id}/`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Token ${token}`,
+            },
+            body: JSON.stringify(subtaskData),
+          });
+        } else {
+          // Create new subtask - MUST include parent_task to link it properly
+          const newSubtaskData = {
+            title: subtask.title,
+            description: subtask.description || '',
+            estimated_duration_minutes: subtask.estimated_duration_minutes,
+            ai_message: '',
+            subtasks: [], // New subtasks don't have their own subtasks
+            parent_task: task.id, // Critical: link to parent task
+            order: i,
+          };
+
+          const createResponse = await fetch(`${API_BASE_URL}/tasks/create/`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Token ${token}`,
+            },
+            body: JSON.stringify(newSubtaskData),
+          });
+
+          if (!createResponse.ok) {
+            const errorData = await createResponse.json();
+            console.error('Failed to create subtask:', errorData);
+            throw new Error('Failed to create subtask: ' + (errorData.error || 'Unknown error'));
           }
         }
       }
@@ -263,9 +352,17 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
       transparent={true}
       onRequestClose={onClose}
     >
-      <View style={styles.overlay}>
-        <View style={styles.modalContainer}>
-          <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
+      <KeyboardAvoidingView 
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={{ flex: 1 }}
+      >
+        <View style={styles.overlay}>
+          <View style={styles.modalContainer}>
+            <ScrollView 
+              style={styles.scrollView} 
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
             <Text style={styles.title}>Edit Task</Text>
 
             {/* Task Title */}
@@ -273,6 +370,7 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
             <TextInput
               style={styles.input}
               placeholder="Enter task title"
+              placeholderTextColor="#9ca3af"
               value={title}
               onChangeText={setTitle}
               maxLength={100}
@@ -283,6 +381,7 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
             <TextInput
               style={[styles.input, styles.textArea]}
               placeholder="Add details (optional)"
+              placeholderTextColor="#9ca3af"
               value={description}
               onChangeText={setDescription}
               multiline
@@ -337,6 +436,7 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
               <TextInput
                 style={[styles.input, styles.locationInput]}
                 placeholder="Add location"
+                placeholderTextColor="#9ca3af"
                 value={location}
                 onChangeText={setLocation}
                 maxLength={500}
@@ -359,21 +459,161 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
             </View>
 
             {/* Scheduled Date & Time */}
-            <Text style={styles.label}>Schedule (Optional)</Text>
-            <View style={styles.scheduleContainer}>
-              <TextInput
-                style={[styles.input, styles.scheduleInput]}
-                placeholder="YYYY-MM-DD"
-                value={scheduledDate}
-                onChangeText={setScheduledDate}
-              />
-              <TextInput
-                style={[styles.input, styles.scheduleInput]}
-                placeholder="HH:MM"
-                value={scheduledTime}
-                onChangeText={setScheduledTime}
-              />
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 16 }}>
+              <Text style={styles.label}>Schedule Task?</Text>
+              <TouchableOpacity
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  backgroundColor: isScheduled ? '#6366f1' : '#e5e7eb',
+                  paddingHorizontal: 12,
+                  paddingVertical: 6,
+                  borderRadius: 8,
+                }}
+                onPress={() => {
+                  const newScheduledState = !isScheduled;
+                  setIsScheduled(newScheduledState);
+                  if (!newScheduledState) {
+                    // Clear scheduling when disabled
+                    setSelectedDate(new Date());
+                    setSelectedTime(new Date());
+                  }
+                }}
+              >
+                <Text style={{ color: isScheduled ? '#fff' : '#6b7280', fontWeight: '600', fontSize: 14 }}>
+                  {isScheduled ? '✓ Scheduled' : 'Unscheduled'}
+                </Text>
+              </TouchableOpacity>
             </View>
+
+            {isScheduled && (
+              <>
+                <View style={styles.scheduleContainer}>
+                  {Platform.OS === 'web' ? (
+                    <>
+                      <input
+                        type="date"
+                        value={selectedDate.toISOString().split('T')[0]}
+                        onChange={(e) => {
+                          const newDate = new Date(e.target.value + 'T00:00:00');
+                          setSelectedDate(newDate);
+                        }}
+                        style={{
+                          flex: 1,
+                          padding: '12px',
+                          fontSize: '16px',
+                          borderRadius: '8px',
+                          border: '1px solid #d1d5db',
+                          marginRight: '8px',
+                          cursor: 'pointer',
+                        }}
+                      />
+                      <input
+                        type="time"
+                        value={(() => {
+                          const roundedTime = roundToNearest15(selectedTime);
+                          return `${String(roundedTime.getHours()).padStart(2, '0')}:${String(roundedTime.getMinutes()).padStart(2, '0')}`;
+                        })()}
+                        onChange={(e) => {
+                          const [hours, minutes] = e.target.value.split(':');
+                          const newTime = new Date();
+                          newTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                          setSelectedTime(roundToNearest15(newTime));
+                        }}
+                        step="900"
+                        style={{
+                          flex: 1,
+                          padding: '12px',
+                          fontSize: '16px',
+                          borderRadius: '8px',
+                          border: '1px solid #d1d5db',
+                          cursor: 'pointer',
+                        }}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <TouchableOpacity
+                        style={[styles.input, styles.scheduleInput, { justifyContent: 'center' }]}
+                        onPress={() => {
+                          setShowTimePicker(false);
+                          setShowDatePicker(true);
+                        }}
+                      >
+                        <Text style={{ fontSize: 16, color: '#111827' }}>{formatDateForDisplay(selectedDate)}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.input, styles.scheduleInput, { justifyContent: 'center' }]}
+                        onPress={() => {
+                          setShowDatePicker(false);
+                          setShowTimePicker(true);
+                        }}
+                      >
+                        <Text style={{ fontSize: 16, color: '#111827' }}>{formatTimeForDisplay(selectedTime)}</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+                </View>
+
+                {showDatePicker && Platform.OS !== 'web' && (
+                  <View style={{ backgroundColor: '#f9fafb', borderRadius: 12, padding: 16, marginTop: 12, marginBottom: 12 }}>
+                    <DateTimePicker
+                      value={selectedDate}
+                      mode="date"
+                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                      textColor="#111827"
+                      onChange={(event, date) => {
+                        if (date) {
+                          setSelectedDate(date);
+                        }
+                        if (Platform.OS !== 'ios' && event.type === 'set') {
+                          setShowDatePicker(false);
+                        }
+                      }}
+                      style={{ height: Platform.OS === 'ios' ? 150 : undefined, width: '100%' }}
+                    />
+                    {Platform.OS === 'ios' && (
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#6366f1', borderRadius: 8, paddingVertical: 10, marginTop: 8 }}
+                        onPress={() => setShowDatePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>Done</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
+
+                {showTimePicker && Platform.OS !== 'web' && (
+                  <View style={{ backgroundColor: '#f9fafb', borderRadius: 12, padding: 16, marginTop: 12, marginBottom: 12 }}>
+                    <DateTimePicker
+                      value={selectedTime}
+                      mode="time"
+                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                      textColor="#111827"
+                      minuteInterval={15}
+                      onChange={(event, time) => {
+                        if (time) {
+                          const roundedTime = roundToNearest15(time);
+                          setSelectedTime(roundedTime);
+                        }
+                        if (Platform.OS !== 'ios' && event.type === 'set') {
+                          setShowTimePicker(false);
+                        }
+                      }}
+                      style={{ height: Platform.OS === 'ios' ? 150 : undefined, width: '100%' }}
+                    />
+                    {Platform.OS === 'ios' && (
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#6366f1', borderRadius: 8, paddingVertical: 10, marginTop: 8 }}
+                        onPress={() => setShowTimePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>Done</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
+              </>
+            )}
 
             {/* Subtasks Section */}
             <View style={{ marginTop: 20, borderTopWidth: 1, borderTopColor: '#e5e7eb', paddingTop: 16 }}>
@@ -397,44 +637,80 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
 
               {subtasks.map((subtask, index) => (
                 <View key={index} style={styles.subtaskCard}>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                    <Text style={{ fontSize: 14, fontWeight: '600', color: '#6b7280' }}>
-                      {subtask.isBreak ? '☕ Break' : `Subtask ${index + 1}`}
-                    </Text>
-                    <TouchableOpacity
-                      onPress={() => handleDeleteSubtask(index)}
-                      style={{ padding: 4 }}
-                    >
-                      <Text style={{ fontSize: 18, color: '#ef4444' }}>×</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <TextInput
-                    style={[styles.input, { marginBottom: 8 }]}
-                    placeholder={subtask.isBreak ? "Break description" : "Subtask name"}
-                    value={subtask.title}
-                    onChangeText={(text) => handleUpdateSubtask(index, 'title', text)}
-                    maxLength={100}
-                  />
-
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                    <Text style={{ fontSize: 13, color: '#6b7280', minWidth: 60 }}>Duration:</Text>
-                    <View style={{ flex: 1 }}>
-                      <Slider
-                        style={{ height: 30 }}
-                        minimumValue={5}
-                        maximumValue={180}
-                        step={5}
-                        value={subtask.estimated_duration_minutes}
-                        onValueChange={(value) => handleUpdateSubtask(index, 'estimated_duration_minutes', value)}
-                        minimumTrackTintColor="#6366f1"
-                        maximumTrackTintColor="#d1d5db"
-                        thumbTintColor="#6366f1"
-                      />
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    {/* Left side: Order controls */}
+                    <View style={{ flexDirection: 'column', gap: 4, marginRight: 8 }}>
+                      <TouchableOpacity
+                        onPress={() => handleMoveSubtaskUp(index)}
+                        disabled={index === 0}
+                        style={{
+                          backgroundColor: index === 0 ? '#e5e7eb' : '#6366f1',
+                          borderRadius: 4,
+                          padding: 4,
+                          width: 28,
+                          alignItems: 'center',
+                        }}
+                      >
+                        <Text style={{ color: index === 0 ? '#9ca3af' : '#fff', fontSize: 12, fontWeight: '600' }}>▲</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        onPress={() => handleMoveSubtaskDown(index)}
+                        disabled={index === subtasks.length - 1}
+                        style={{
+                          backgroundColor: index === subtasks.length - 1 ? '#e5e7eb' : '#6366f1',
+                          borderRadius: 4,
+                          padding: 4,
+                          width: 28,
+                          alignItems: 'center',
+                        }}
+                      >
+                        <Text style={{ color: index === subtasks.length - 1 ? '#9ca3af' : '#fff', fontSize: 12, fontWeight: '600' }}>▼</Text>
+                      </TouchableOpacity>
                     </View>
-                    <Text style={{ fontSize: 13, fontWeight: '600', color: '#111827', minWidth: 60, textAlign: 'right' }}>
-                      {formatDuration(subtask.estimated_duration_minutes)}
-                    </Text>
+
+                    {/* Middle: Subtask content */}
+                    <View style={{ flex: 1 }}>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                        <Text style={{ fontSize: 14, fontWeight: '600', color: '#6b7280' }}>
+                          {subtask.isBreak ? '☕ Break' : `Subtask ${index + 1}`}
+                        </Text>
+                        <TouchableOpacity
+                          onPress={() => handleDeleteSubtask(index)}
+                          style={{ padding: 4 }}
+                        >
+                          <Text style={{ fontSize: 18, color: '#ef4444' }}>×</Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      <TextInput
+                        style={[styles.input, { marginBottom: 8 }]}
+                        placeholder={subtask.isBreak ? "Break description" : "Subtask name"}
+                        placeholderTextColor="#9ca3af"
+                        value={subtask.title}
+                        onChangeText={(text) => handleUpdateSubtask(index, 'title', text)}
+                        maxLength={100}
+                      />
+
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                        <Text style={{ fontSize: 13, color: '#6b7280', minWidth: 60 }}>Duration:</Text>
+                        <View style={{ flex: 1 }}>
+                          <Slider
+                            style={{ height: 30 }}
+                            minimumValue={5}
+                            maximumValue={180}
+                            step={5}
+                            value={subtask.estimated_duration_minutes}
+                            onValueChange={(value) => handleUpdateSubtask(index, 'estimated_duration_minutes', value)}
+                            minimumTrackTintColor="#6366f1"
+                            maximumTrackTintColor="#d1d5db"
+                            thumbTintColor="#6366f1"
+                          />
+                        </View>
+                        <Text style={{ fontSize: 13, fontWeight: '600', color: '#111827', minWidth: 60, textAlign: 'right' }}>
+                          {formatDuration(subtask.estimated_duration_minutes)}
+                        </Text>
+                      </View>
+                    </View>
                   </View>
                 </View>
               ))}
@@ -459,9 +735,10 @@ export default function EditTaskModal({ visible, task, onClose, onTaskUpdated }:
                 </Text>
               </TouchableOpacity>
             </View>
-          </ScrollView>
+            </ScrollView>
+          </View>
         </View>
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }

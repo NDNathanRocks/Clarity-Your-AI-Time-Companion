@@ -8,12 +8,14 @@ import {
   StyleSheet,
   ScrollView,
   Alert,
-  Platform
+  Platform,
+  KeyboardAvoidingView
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import { API_BASE_URL } from '../config';
 
 // Pastel color scheme for priorities
 const PRIORITY_COLORS = {
@@ -41,8 +43,16 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
   const [priority, setPriority] = useState<'low' | 'medium' | 'high'>('medium');
   const [location, setLocation] = useState('');
   const [duration, setDuration] = useState(60); // minutes, default 1 hour
+  
+  // Initialize date to today, time to 9:00 AM
+  const getDefaultTime = () => {
+    const time = new Date();
+    time.setHours(9, 0, 0, 0); // 9:00 AM
+    return time;
+  };
+  
   const [selectedDate, setSelectedDate] = useState(new Date());
-  const [selectedTime, setSelectedTime] = useState(new Date());
+  const [selectedTime, setSelectedTime] = useState(getDefaultTime());
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [isScheduled, setIsScheduled] = useState(false);
@@ -106,7 +116,9 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
   };
 
   const formatDateForDisplay = (date: Date): string => {
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = date.toLocaleDateString('en-US', { month: 'short' });
+    return `${day} ${month}`;
   };
 
   const formatTimeForDisplay = (date: Date): string => {
@@ -123,23 +135,35 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
     return newDate;
   };
 
+  // Calculate total duration from subtasks
+  const calculateTotalDuration = (subtaskList: Subtask[]) => {
+    if (subtaskList.length === 0) return duration; // Keep current duration if no subtasks
+    return subtaskList.reduce((total, st) => total + st.estimated_duration_minutes, 0);
+  };
+
   const handleAddSubtask = () => {
-    setSubtasks([...subtasks, { title: '', estimated_duration_minutes: 30 }]);
+    const updated = [...subtasks, { title: '', estimated_duration_minutes: 30 }];
+    setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   const handleAddBreak = () => {
-    setSubtasks([...subtasks, { title: 'Break', estimated_duration_minutes: 15, description: 'Take a break', isBreak: true }]);
+    const updated = [...subtasks, { title: 'Break', estimated_duration_minutes: 15, description: 'Take a break', isBreak: true }];
+    setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   const handleUpdateSubtask = (index: number, field: string, value: any) => {
     const updated = [...subtasks];
     updated[index] = { ...updated[index], [field]: value };
     setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   const handleDeleteSubtask = (index: number) => {
     const updated = subtasks.filter((_, i) => i !== index);
     setSubtasks(updated);
+    setDuration(calculateTotalDuration(updated));
   };
 
   // Trigger breakdown analysis
@@ -148,9 +172,6 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
 
     try {
       const token = await AsyncStorage.getItem('authToken');
-      const API_BASE_URL = Platform.OS === 'web' 
-        ? 'http://localhost:8000/api'
-        : 'http://172.16.82.137:8000/api';
 
       const response = await fetch(`${API_BASE_URL}/tasks/breakdown/`, {
         method: 'POST',
@@ -170,11 +191,13 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
       
       if (data.should_break_down && data.suggested_subtasks && data.suggested_subtasks.length > 0) {
         setBreakdownData(data);
-        setSubtasks(data.suggested_subtasks.map((st: any) => ({
+        const suggestedSubtasks = data.suggested_subtasks.map((st: any) => ({
           title: st.title,
           estimated_duration_minutes: st.estimated_duration_minutes || st.estimated_minutes || 30,
           description: st.description || '',
-        })));
+        }));
+        setSubtasks(suggestedSubtasks);
+        setDuration(calculateTotalDuration(suggestedSubtasks));
         setShowBreakdownConfirm(true);
         return true;
       }
@@ -211,11 +234,6 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
       // Get auth token
       const token = await AsyncStorage.getItem('authToken');
       
-      // Get API base URL
-      const API_BASE_URL = Platform.OS === 'web' 
-        ? 'http://localhost:8000/api'
-        : 'http://172.16.82.137:8000/api';
-      
       // Format date and time
       const year = selectedDate.getFullYear();
       const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
@@ -246,7 +264,10 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
       if (isScheduled) {
         taskData.scheduled_date = dateStr;
         taskData.scheduled_time = timeStr;
+        console.log('📅 Scheduling task:', { dateStr, timeStr, selectedDate, selectedTime });
       }
+
+      console.log('📤 Creating task with data:', taskData);
 
       const response = await fetch(`${API_BASE_URL}/tasks/create/`, {
         method: 'POST',
@@ -269,12 +290,17 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
       setLocation('');
       setDuration(60);
       setSelectedDate(new Date());
-      setSelectedTime(new Date());
+      setSelectedTime(getDefaultTime());
       setSubtasks([]);
       setBreakdownData(null);
       setShowBreakdownConfirm(false);
+      setIsScheduled(false);
 
-      Alert.alert('Success', 'Task created successfully!');
+      if (isScheduled) {
+        Alert.alert('✅ Success', `Task scheduled for ${formatDateForDisplay(selectedDate)} at ${formatTimeForDisplay(selectedTime)}!\n\nNavigate to that date on the calendar to view it.`);
+      } else {
+        Alert.alert('✅ Success', 'Task created successfully!');
+      }
       onTaskCreated();
       onClose();
     } catch (error: any) {
@@ -292,9 +318,17 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
       transparent={true}
       onRequestClose={onClose}
     >
-      <View style={styles.overlay}>
-        <View style={styles.modalContainer}>
-          <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
+      <KeyboardAvoidingView 
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={{ flex: 1 }}
+      >
+        <View style={styles.overlay}>
+          <View style={styles.modalContainer}>
+            <ScrollView 
+              style={styles.scrollView} 
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
             <Text style={styles.title}>Add New Task</Text>
 
             {/* Task Title */}
@@ -302,6 +336,7 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
             <TextInput
               style={styles.input}
               placeholder="Enter task title"
+              placeholderTextColor="#9ca3af"
               value={title}
               onChangeText={setTitle}
               maxLength={100}
@@ -312,6 +347,7 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
             <TextInput
               style={[styles.input, styles.textArea]}
               placeholder="Add details (optional)"
+              placeholderTextColor="#9ca3af"
               value={description}
               onChangeText={setDescription}
               multiline
@@ -360,12 +396,46 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
               <Text style={styles.sliderLabel}>12hr</Text>
             </View>
 
+            {/* Clarity Breakdown Button */}
+            {!showBreakdownConfirm && subtasks.length === 0 && (
+              <TouchableOpacity
+                style={{
+                  backgroundColor: '#eff6ff',
+                  borderWidth: 2,
+                  borderColor: '#6366f1',
+                  borderStyle: 'dashed',
+                  borderRadius: 12,
+                  paddingVertical: 12,
+                  paddingHorizontal: 16,
+                  marginTop: 16,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+                onPress={async () => {
+                  if (!title.trim()) {
+                    Alert.alert('Missing Title', 'Please enter a task title first');
+                    return;
+                  }
+                  setLoading(true);
+                  await checkForBreakdown();
+                  setLoading(false);
+                }}
+              >
+                <Text style={{ fontSize: 20, marginRight: 8 }}>✨</Text>
+                <Text style={{ fontSize: 16, fontWeight: '600', color: '#6366f1' }}>
+                  Clarity Breakdown
+                </Text>
+              </TouchableOpacity>
+            )}
+
             {/* Location */}
             <Text style={styles.label}>Location (Optional)</Text>
             <View style={styles.locationContainer}>
               <TextInput
                 style={[styles.input, styles.locationInput]}
                 placeholder="Add location"
+                placeholderTextColor="#9ca3af"
                 value={location}
                 onChangeText={setLocation}
                 maxLength={500}
@@ -399,7 +469,15 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
                   paddingVertical: 6,
                   borderRadius: 8,
                 }}
-                onPress={() => setIsScheduled(!isScheduled)}
+                onPress={() => {
+                  const newScheduledState = !isScheduled;
+                  setIsScheduled(newScheduledState);
+                  // Reset to defaults when enabling scheduling
+                  if (newScheduledState) {
+                    setSelectedDate(new Date());
+                    setSelectedTime(getDefaultTime());
+                  }
+                }}
               >
                 <Text style={{ color: isScheduled ? '#fff' : '#6b7280', fontWeight: '600', fontSize: 14 }}>
                   {isScheduled ? '✓ Scheduled' : 'Unscheduled'}
@@ -408,64 +486,153 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
             </View>
 
             {isScheduled && (
-              <View style={styles.scheduleContainer}>
-              <TouchableOpacity
-                style={[styles.input, styles.scheduleInput, { justifyContent: 'center' }]}
-                onPress={() => setShowDatePicker(true)}
-              >
-                <Text style={{ fontSize: 16, color: '#111827' }}>{formatDateForDisplay(selectedDate)}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.input, styles.scheduleInput, { justifyContent: 'center' }]}
-                onPress={() => setShowTimePicker(true)}
-              >
-                <Text style={{ fontSize: 16, color: '#111827' }}>{formatTimeForDisplay(selectedTime)}</Text>
-              </TouchableOpacity>
-              </View>
-            )}
+              <>
+                <View style={styles.scheduleContainer}>
+                  {Platform.OS === 'web' ? (
+                    <>
+                      {/* Native HTML date/time inputs for web */}
+                      <input
+                        type="date"
+                        value={selectedDate.toISOString().split('T')[0]}
+                        onChange={(e) => {
+                          const newDate = new Date(e.target.value + 'T00:00:00');
+                          setSelectedDate(newDate);
+                        }}
+                        style={{
+                          flex: 1,
+                          padding: '12px',
+                          fontSize: '16px',
+                          borderRadius: '8px',
+                          border: '1px solid #d1d5db',
+                          marginRight: '8px',
+                          cursor: 'pointer',
+                        }}
+                      />
+                      <input
+                        type="time"
+                        value={(() => {
+                          const roundedTime = roundToNearest15(selectedTime);
+                          return `${String(roundedTime.getHours()).padStart(2, '0')}:${String(roundedTime.getMinutes()).padStart(2, '0')}`;
+                        })()}
+                        onChange={(e) => {
+                          const [hours, minutes] = e.target.value.split(':');
+                          const newTime = new Date();
+                          newTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                          setSelectedTime(roundToNearest15(newTime));
+                        }}
+                        step="900"
+                        style={{
+                          flex: 1,
+                          padding: '12px',
+                          fontSize: '16px',
+                          borderRadius: '8px',
+                          border: '1px solid #d1d5db',
+                          cursor: 'pointer',
+                        }}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <TouchableOpacity
+                        style={[styles.input, styles.scheduleInput, { justifyContent: 'center' }]}
+                        onPress={() => {
+                          setShowTimePicker(false);
+                          setShowDatePicker(true);
+                        }}
+                      >
+                        <Text style={{ fontSize: 16, color: '#111827' }}>{formatDateForDisplay(selectedDate)}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.input, styles.scheduleInput, { justifyContent: 'center' }]}
+                        onPress={() => {
+                          setShowDatePicker(false);
+                          setShowTimePicker(true);
+                        }}
+                      >
+                        <Text style={{ fontSize: 16, color: '#111827' }}>{formatTimeForDisplay(selectedTime)}</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+                </View>
 
-            {showDatePicker && (
-              <DateTimePicker
-                value={selectedDate}
-                mode="date"
-                display="spinner"
-                onChange={(event, date) => {
-                  if (Platform.OS === 'android') {
-                    setShowDatePicker(false);
-                  }
-                  if (event.type === 'set' && date) {
-                    setSelectedDate(date);
-                    if (Platform.OS === 'ios') {
-                      setShowDatePicker(false);
-                    }
-                  } else if (event.type === 'dismissed') {
-                    setShowDatePicker(false);
-                  }
-                }}
-              />
-            )}
+                {/* Date Picker Wheel - Only for iOS/Android */}
+                {showDatePicker && Platform.OS !== 'web' && (
+                  <View style={{ backgroundColor: '#f9fafb', borderRadius: 12, padding: 16, marginTop: 12, marginBottom: 12 }}>
+                    <DateTimePicker
+                      value={selectedDate}
+                      mode="date"
+                      display={Platform.OS === 'web' ? 'default' : (Platform.OS === 'ios' ? 'spinner' : 'default')}
+                      textColor="#111827"
+                      onChange={(event, date) => {
+                        if (date) {
+                          setSelectedDate(date);
+                        }
+                        // Auto-close on web/Android after selection
+                        if (Platform.OS !== 'ios' && event.type === 'set') {
+                          setShowDatePicker(false);
+                        }
+                      }}
+                      style={{ height: Platform.OS === 'ios' ? 150 : undefined, width: '100%' }}
+                    />
+                    {Platform.OS === 'ios' && (
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#6366f1', borderRadius: 8, paddingVertical: 10, marginTop: 8 }}
+                        onPress={() => setShowDatePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>Done</Text>
+                      </TouchableOpacity>
+                    )}
+                    {Platform.OS === 'web' && (
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#6366f1', borderRadius: 8, paddingVertical: 10, marginTop: 12 }}
+                        onPress={() => setShowDatePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>Confirm</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
 
-            {showTimePicker && (
-              <DateTimePicker
-                value={selectedTime}
-                mode="time"
-                display="spinner"
-                minuteInterval={15}
-                onChange={(event, time) => {
-                  if (Platform.OS === 'android') {
-                    setShowTimePicker(false);
-                  }
-                  if (event.type === 'set' && time) {
-                    const roundedTime = roundToNearest15(time);
-                    setSelectedTime(roundedTime);
-                    if (Platform.OS === 'ios') {
-                      setShowTimePicker(false);
-                    }
-                  } else if (event.type === 'dismissed') {
-                    setShowTimePicker(false);
-                  }
-                }}
-              />
+                {/* Time Picker Wheel - Only for iOS/Android */}
+                {showTimePicker && Platform.OS !== 'web' && (
+                  <View style={{ backgroundColor: '#f9fafb', borderRadius: 12, padding: 16, marginTop: 12, marginBottom: 12 }}>
+                    <DateTimePicker
+                      value={selectedTime}
+                      mode="time"
+                      display={Platform.OS === 'web' ? 'default' : (Platform.OS === 'ios' ? 'spinner' : 'default')}
+                      textColor="#111827"
+                      minuteInterval={15}
+                      onChange={(event, time) => {
+                        if (time) {
+                          const roundedTime = roundToNearest15(time);
+                          setSelectedTime(roundedTime);
+                        }
+                        // Auto-close on web/Android after selection
+                        if (Platform.OS !== 'ios' && event.type === 'set') {
+                          setShowTimePicker(false);
+                        }
+                      }}
+                      style={{ height: Platform.OS === 'ios' ? 150 : undefined, width: '100%' }}
+                    />
+                    {Platform.OS === 'ios' && (
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#6366f1', borderRadius: 8, paddingVertical: 10, marginTop: 8 }}
+                        onPress={() => setShowTimePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>Done</Text>
+                      </TouchableOpacity>
+                    )}
+                    {Platform.OS === 'web' && (
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#6366f1', borderRadius: 8, paddingVertical: 10, marginTop: 12 }}
+                        onPress={() => setShowTimePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', textAlign: 'center', fontWeight: '600' }}>Confirm</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
+              </>
             )}
 
             {/* Breakdown Confirmation */}
@@ -543,10 +710,11 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
                       </TouchableOpacity>
                     </View>
 
-                    <TextInput
-                      style={[styles.input, { marginBottom: 8 }]}
-                      placeholder={subtask.isBreak ? "Break description" : "Subtask name"}
-                      value={subtask.title}
+                  <TextInput
+                    style={[styles.input, { marginBottom: 8 }]}
+                    placeholder={subtask.isBreak ? "Break description" : "Subtask name"}
+                    placeholderTextColor="#9ca3af"
+                    value={subtask.title}
                       onChangeText={(text) => handleUpdateSubtask(index, 'title', text)}
                       maxLength={100}
                     />
@@ -597,6 +765,7 @@ export default function AddTaskModal({ visible, onClose, onTaskCreated }: AddTas
           </ScrollView>
         </View>
       </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }

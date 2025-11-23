@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext } from 'react';
 import {
   StyleSheet,
   Text,
@@ -23,22 +23,11 @@ import * as WebBrowser from 'expo-web-browser';
 import axios from 'axios';
 import AddTaskModal from './components/AddTaskModal';
 import EditTaskModal from './components/EditTaskModal';
+import { API_BASE_URL } from './config';
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
-
-// Use your laptop's IP address for mobile devices to connect
-// Change this to your laptop's local IP (run 'ipconfig' on Windows or 'ifconfig' on Mac)
-// For iOS Simulator, use localhost. For physical devices, use your computer's IP
-const API_BASE_URL = Platform.OS === 'web' 
-  ? 'http://localhost:8000/api'
-  : Platform.OS === 'ios'
-    ? 'http://172.16.208.98:8000/api'  // iOS Simulator can use localhost
-    : 'http://172.16.208.98:8000/api';  // Android/Physical devices need your laptop's IP
-
-console.log('[CONFIG] API Base URL:', API_BASE_URL);
-console.log('[CONFIG] Platform:', Platform.OS);
 
 // Configure axios
 const api = axios.create({
@@ -64,6 +53,21 @@ api.interceptors.request.use(
   },
   (error) => {
     console.error('[API REQUEST ERROR]', error);
+    return Promise.reject(error);
+  }
+);
+
+// Add response interceptor to handle 401 errors globally
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error.response?.status === 401) {
+      console.log('[API] 401 Unauthorized - Token may be invalid, clearing auth data');
+      // Clear stored auth data
+      await AsyncStorage.removeItem('authToken');
+      await AsyncStorage.removeItem('user');
+      // Note: The app will need to be reloaded to update auth state
+    }
     return Promise.reject(error);
   }
 );
@@ -126,6 +130,9 @@ interface CalendarEvent {
   source: 'google_calendar' | 'app';
   color?: string;
   all_day?: boolean;
+  priority?: 'low' | 'medium' | 'high' | null;
+  status?: 'pending' | 'in_progress' | 'done' | 'overdue' | null;
+  task_id?: number | null;
 }
 
 interface ChatMessage {
@@ -165,8 +172,9 @@ interface AuthContextType {
   user: User | null;
   token: string | null;
   login: (username: string, password: string) => Promise<void>;
-  register: (username: string, email: string, password: string) => Promise<void>;
+  register: (username: string, email: string, password: string, firstName?: string, lastName?: string) => Promise<void>;
   logout: () => Promise<void>;
+  updateUser: (userData: User) => Promise<void>;
   loading: boolean;
 }
 
@@ -177,6 +185,7 @@ const AuthContext = React.createContext<AuthContextType>({
   login: async () => {},
   register: async () => {},
   logout: async () => {},
+  updateUser: async () => {},
   loading: true,
 });
 
@@ -258,7 +267,7 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
     }
   };
 
-  const register = async (username: string, email: string, password: string) => {
+  const register = async (username: string, email: string, password: string, firstName?: string, lastName?: string) => {
     try {
       console.log('[REGISTER] Attempting registration...');
       console.log('[REGISTER] API Base URL:', API_BASE_URL);
@@ -266,6 +275,8 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
         username,
         email,
         password,
+        first_name: firstName || '',
+        last_name: lastName || '',
       });
       console.log('[REGISTER] Response received:', response.status);
       const { token: authToken, user: userData } = response.data;
@@ -340,9 +351,19 @@ const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => 
     }
   };
 
+  const updateUser = async (userData: User) => {
+    try {
+      setUser(userData);
+      await AsyncStorage.setItem('user', JSON.stringify(userData));
+      console.log('[AUTH] User updated:', userData);
+    } catch (error) {
+      console.error('[AUTH] Error updating user:', error);
+    }
+  };
+
   return (
     <AuthContext.Provider
-      value={{ isAuthenticated, user, token, login, register, logout, loading }}
+      value={{ isAuthenticated, user, token, login, register, logout, updateUser, loading }}
     >
       {children}
     </AuthContext.Provider>
@@ -376,25 +397,35 @@ const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   };
 
   return (
-    <View style={styles.authContainer}>
-      <Text style={styles.appTitle}>Clarity</Text>
-      <Text style={styles.subtitle}>Your AI Time Awareness Assistant</Text>
+    <KeyboardAvoidingView 
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      style={{ flex: 1 }}
+    >
+      <ScrollView 
+        contentContainerStyle={styles.authScrollContainer}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={styles.authContentWrapper}>
+          <Text style={styles.appTitle}>Clarity</Text>
+          <Text style={styles.subtitle}>Your AI Time Awareness Assistant</Text>
 
-      <View style={styles.authForm}>
-        <TextInput
-          style={styles.input}
-          placeholder="Username"
-          value={username}
-          onChangeText={setUsername}
-          autoCapitalize="none"
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Password"
-          value={password}
-          onChangeText={setPassword}
-          secureTextEntry
-        />
+          <View style={styles.authForm}>
+            <TextInput
+              style={styles.input}
+              placeholder="Username"
+              placeholderTextColor="#9ca3af"
+              value={username}
+              onChangeText={setUsername}
+              autoCapitalize="none"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Password"
+              placeholderTextColor="#9ca3af"
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+            />
 
         <TouchableOpacity
           style={[styles.button, styles.primaryButton]}
@@ -415,7 +446,9 @@ const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
           <Text style={styles.linkText}>Don't have an account? Register</Text>
         </TouchableOpacity>
       </View>
-    </View>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -423,18 +456,20 @@ const RegisterScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
   const [loading, setLoading] = useState(false);
   const { register } = React.useContext(AuthContext);
 
   const handleRegister = async () => {
     if (!username || !email || !password) {
-      Alert.alert('Error', 'Please fill in all fields');
+      Alert.alert('Error', 'Please fill in all required fields (username, email, password)');
       return;
     }
 
     setLoading(true);
     try {
-      await register(username, email, password);
+      await register(username, email, password, firstName, lastName);
     } catch (error: any) {
       Alert.alert('Registration Failed', error.message);
     } finally {
@@ -443,32 +478,59 @@ const RegisterScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   };
 
   return (
-    <View style={styles.authContainer}>
-      <Text style={styles.appTitle}>Create Account</Text>
+    <KeyboardAvoidingView 
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      style={{ flex: 1 }}
+    >
+      <ScrollView 
+        contentContainerStyle={styles.authScrollContainer}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={styles.authContentWrapper}>
+          <Text style={styles.appTitle}>Create Account</Text>
 
-      <View style={styles.authForm}>
-        <TextInput
-          style={styles.input}
-          placeholder="Username"
-          value={username}
-          onChangeText={setUsername}
-          autoCapitalize="none"
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Email"
-          value={email}
-          onChangeText={setEmail}
-          autoCapitalize="none"
-          keyboardType="email-address"
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Password"
-          value={password}
-          onChangeText={setPassword}
-          secureTextEntry
-        />
+          <View style={styles.authForm}>
+            <TextInput
+              style={styles.input}
+              placeholder="First Name (Optional)"
+              placeholderTextColor="#9ca3af"
+              value={firstName}
+              onChangeText={setFirstName}
+              autoCapitalize="words"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Last Name (Optional)"
+              placeholderTextColor="#9ca3af"
+              value={lastName}
+              onChangeText={setLastName}
+              autoCapitalize="words"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Username"
+              placeholderTextColor="#9ca3af"
+              value={username}
+              onChangeText={setUsername}
+              autoCapitalize="none"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Email"
+              placeholderTextColor="#9ca3af"
+              value={email}
+              onChangeText={setEmail}
+              autoCapitalize="none"
+              keyboardType="email-address"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Password"
+              placeholderTextColor="#9ca3af"
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+            />
 
         <TouchableOpacity
           style={[styles.button, styles.primaryButton]}
@@ -489,7 +551,9 @@ const RegisterScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
           <Text style={styles.linkText}>Already have an account? Login</Text>
         </TouchableOpacity>
       </View>
-    </View>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -497,18 +561,37 @@ const RegisterScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
 // HOME SCREEN
 // ============================================================================
 
-const HomeScreen: React.FC = () => {
+const HomeScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const { user, isAuthenticated, token } = React.useContext(AuthContext);
+  const { user, isAuthenticated, token, logout } = React.useContext(AuthContext);
+  const isFocused = useIsFocused();
 
+  // Fetch data when authenticated
   useEffect(() => {
-    // Wait for auth to be ready before fetching
     if (isAuthenticated && token) {
       fetchData();
     }
+  }, [isAuthenticated, token]);
+
+  // Refresh when page is focused (navigating back to home)
+  useEffect(() => {
+    if (isFocused && isAuthenticated && token) {
+      fetchData();
+    }
+  }, [isFocused]);
+
+  // Auto-refresh every minute
+  useEffect(() => {
+    if (!isAuthenticated || !token) return;
+    
+    const interval = setInterval(() => {
+      fetchData();
+    }, 60000); // 60 seconds
+
+    return () => clearInterval(interval);
   }, [isAuthenticated, token]);
 
   const fetchData = async () => {
@@ -530,28 +613,21 @@ const HomeScreen: React.FC = () => {
       const eventsData = eventsResponse.data.events || eventsResponse.data || [];
       setEvents(eventsData);
       
-      // Filter for today's tasks
-      setTasks(tasksResponse.data.filter((t: Task) => t.status === 'pending'));
+      // Set all tasks
+      setTasks(tasksResponse.data);
     } catch (error: any) {
       console.error('[HOME] Error fetching data:', error);
       
-      // If auth error, retry once after a delay
+      // If auth error, clear auth and show alert
       if (error.response?.status === 401) {
-        console.log('[HOME] Got 401, retrying in 200ms...');
-        await new Promise(resolve => setTimeout(resolve, 200));
-        try {
-          const [eventsResponse, tasksResponse] = await Promise.all([
-            api.get('/calendar/events/'),
-            api.get('/tasks/'),
-          ]);
-          const eventsData = eventsResponse.data.events || eventsResponse.data || [];
-          setEvents(eventsData);
-          setTasks(tasksResponse.data.filter((t: Task) => t.status === 'pending'));
-        } catch (retryError) {
-          console.error('[HOME] Retry failed:', retryError);
-          setEvents([]);
-          setTasks([]);
-        }
+        console.log('[HOME] Got 401 - Authentication failed');
+        Alert.alert(
+          'Session Expired',
+          'Your session has expired. Please log in again.',
+          [{ text: 'OK', onPress: () => logout() }]
+        );
+        setEvents([]);
+        setTasks([]);
       } else {
         setEvents([]);
         setTasks([]);
@@ -567,6 +643,146 @@ const HomeScreen: React.FC = () => {
     fetchData();
   };
 
+  // Get current week start (Sunday)
+  const getWeekStart = () => {
+    const now = new Date();
+    const day = now.getDay();
+    const diff = now.getDate() - day;
+    return new Date(now.setDate(diff));
+  };
+
+  // Calculate weekly statistics
+  const getWeeklyStats = () => {
+    const weekStart = getWeekStart();
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 7);
+
+    const weeklyTasks = tasks.filter(task => {
+      const createdDate = new Date(task.created_at);
+      return createdDate >= weekStart && createdDate < weekEnd;
+    });
+
+    const completedThisWeek = weeklyTasks.filter(t => t.status === 'done').length;
+    const totalThisWeek = weeklyTasks.length;
+
+    return { completedThisWeek, totalThisWeek };
+  };
+
+  // Get today's statistics
+  const getTodayStats = () => {
+    const today = new Date();
+    const todayStr = formatDate(today);
+
+    console.log('[HOME STATS] Today:', todayStr);
+    console.log('[HOME STATS] Total tasks:', tasks.length);
+
+    // Filter tasks completed today (check completed_at date)
+    const completedToday = tasks.filter(task => {
+      if (task.status !== 'done') return false;
+      
+      // Check if completed_at exists and is today
+      if (task.completed_at) {
+        const completedDate = new Date(task.completed_at);
+        const completedDateStr = formatDate(completedDate);
+        const isToday = completedDateStr === todayStr;
+        if (isToday) {
+          console.log('[HOME STATS] Task completed today:', task.title, 'at', task.completed_at);
+        }
+        return isToday;
+      }
+      
+      // Fallback: if no completed_at but status is done, check updated_at
+      if (task.updated_at) {
+        const updatedDate = new Date(task.updated_at);
+        const updatedDateStr = formatDate(updatedDate);
+        const isToday = updatedDateStr === todayStr;
+        if (isToday) {
+          console.log('[HOME STATS] Task marked done today (via updated_at):', task.title);
+        }
+        return isToday;
+      }
+      
+      return false;
+    });
+
+    const completedCount = completedToday.length;
+    console.log('[HOME STATS] Completed today count:', completedCount);
+    
+    // Calculate focus time (sum of completed task durations today)
+    const focusTimeMinutes = completedToday.reduce((sum, t) => sum + t.estimated_duration_minutes, 0);
+    console.log('[HOME STATS] Focus time minutes:', focusTimeMinutes);
+    
+    // Get today's events from calendar (unique events only)
+    const todayEvents = events.filter(event => {
+      const eventDate = new Date(event.start);
+      const eventDateStr = formatDate(eventDate);
+      return eventDateStr === todayStr;
+    });
+
+    // Get today's scheduled tasks that have calendar events
+    const todayScheduledTasksWithEvents = tasks.filter(task => {
+      return task.scheduled_date === todayStr && task.calendar_event_id;
+    });
+
+    // Count events, but don't double count tasks that are already calendar events
+    const eventCount = todayEvents.length;
+    
+    console.log('[HOME STATS] Calendar events today:', eventCount);
+    console.log('[HOME STATS] Tasks with calendar events:', todayScheduledTasksWithEvents.length);
+
+    return {
+      completedToday: completedCount,
+      focusTimeHours: focusTimeMinutes / 60,
+      eventsToday: eventCount
+    };
+  };
+
+  // Get today's focus tasks (scheduled for today or high priority)
+  const getTodayFocusTasks = () => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = formatDate(today);
+
+    return tasks
+      .filter(task => {
+        if (task.status === 'done') return false;
+        
+        // Include if scheduled for today
+        if (task.scheduled_date === todayStr) return true;
+        
+        // Include high priority tasks that aren't scheduled for future dates
+        if (task.priority === 'high' && !task.scheduled_date) return true;
+        
+        return false;
+      })
+      .sort((a, b) => {
+        // Sort by priority first
+        const priorityOrder = { high: 0, medium: 1, low: 2 };
+        const aPriority = priorityOrder[a.priority || 'medium'];
+        const bPriority = priorityOrder[b.priority || 'medium'];
+        
+        if (aPriority !== bPriority) return aPriority - bPriority;
+        
+        // Then by scheduled time
+        if (a.scheduled_time && b.scheduled_time) {
+          return a.scheduled_time.localeCompare(b.scheduled_time);
+        }
+        if (a.scheduled_time) return -1;
+        if (b.scheduled_time) return 1;
+        
+        return 0;
+      })
+      .slice(0, 5);
+  };
+
+  // Format date as YYYY-MM-DD
+  const formatDate = (date: Date): string => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
   if (loading) {
     return (
       <View style={styles.centerContainer}>
@@ -575,63 +791,141 @@ const HomeScreen: React.FC = () => {
     );
   }
 
+  const weeklyStats = getWeeklyStats();
+  const todayStats = getTodayStats();
+  const focusTasks = getTodayFocusTasks();
+  const progressPercentage = weeklyStats.totalThisWeek > 0 
+    ? (weeklyStats.completedThisWeek / weeklyStats.totalThisWeek) * 100 
+    : 0;
+
   return (
     <ScrollView
       style={styles.container}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
     >
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>Welcome back, {user?.first_name || user?.username}!</Text>
-        <Text style={styles.headerSubtitle}>Here's your day at a glance</Text>
+      {/* Welcome Header */}
+      <View style={styles.welcomeHeader}>
+        <Text style={styles.welcomeTitle}>Welcome back, {user?.first_name || user?.username}! 👋</Text>
+        <Text style={styles.welcomeSubtitle}>Here's your productivity at a glance</Text>
       </View>
 
-      {/* Today's Tasks */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>📝 Today's Tasks ({tasks.length})</Text>
-        {tasks.length === 0 ? (
-          <View style={styles.card}>
-            <Text style={styles.emptyText}>No tasks yet. Add one to get started!</Text>
-          </View>
-        ) : (
-          tasks.slice(0, 5).map((task) => (
-            <View key={task.id} style={styles.card}>
-              <Text style={styles.cardTitle}>{task.title}</Text>
-              <Text style={styles.cardSubtitle}>
-                ⏱️ Estimated: {formatDuration(task.estimated_duration_minutes)}
-              </Text>
-            </View>
-          ))
-        )}
+      {/* Weekly Progress Section */}
+      <View style={styles.homeSection}>
+        <View style={styles.progressHeader}>
+          <Text style={styles.progressIcon}>📈</Text>
+          <Text style={styles.progressTitle}>Weekly Progress</Text>
+        </View>
+        
+        <Text style={styles.progressLabel}>Tasks completed this week</Text>
+        <Text style={styles.progressCount}>{weeklyStats.completedThisWeek} / {weeklyStats.totalThisWeek}</Text>
+        
+        <View style={styles.progressBarContainer}>
+          <View style={[styles.progressBarFill, { width: `${progressPercentage}%` }]} />
+        </View>
+        
+        <Text style={styles.progressMessage}>
+          {weeklyStats.completedThisWeek > 0 
+            ? "You're making great progress! Keep up the momentum." 
+            : "Let's get started on some tasks this week!"}
+        </Text>
       </View>
 
-      {/* Calendar Events */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>📅 Upcoming Events ({events.length})</Text>
-        {events.length === 0 ? (
-          <View style={styles.card}>
-            <Text style={styles.emptyText}>
-              No upcoming events. Add one in the Calendar tab!
-            </Text>
+      {/* Statistics Cards */}
+      <View style={styles.statsRow}>
+        <View style={styles.statCard}>
+          <View style={styles.statIconContainer}>
+            <Text style={styles.statIcon}>✓</Text>
+          </View>
+          <Text style={styles.statLabel}>Completed Today</Text>
+          <Text style={styles.statValue}>{todayStats.completedToday}</Text>
+        </View>
+
+        <View style={styles.statCard}>
+          <View style={[styles.statIconContainer, { backgroundColor: '#DBEAFE' }]}>
+            <Text style={styles.statIcon}>⏱️</Text>
+          </View>
+          <Text style={styles.statLabel}>Focus Time</Text>
+          <Text style={styles.statValue}>{todayStats.focusTimeHours.toFixed(1)}h</Text>
+        </View>
+
+        <View style={styles.statCard}>
+          <View style={[styles.statIconContainer, { backgroundColor: '#FEF3C7' }]}>
+            <Text style={styles.statIcon}>📅</Text>
+          </View>
+          <Text style={styles.statLabel}>Events Today</Text>
+          <Text style={styles.statValue}>{todayStats.eventsToday}</Text>
+        </View>
+      </View>
+
+      {/* Today's Focus Section */}
+      <View style={styles.homeSection}>
+        <View style={styles.focusHeader}>
+          <View>
+            <Text style={styles.focusIcon}>✨</Text>
+            <Text style={styles.focusTitle}>Today's Focus</Text>
+          </View>
+          <TouchableOpacity 
+            onPress={() => navigation?.navigate('Tasks')}
+            style={styles.viewAllButton}
+          >
+            <Text style={styles.viewAllText}>View All</Text>
+          </TouchableOpacity>
+        </View>
+
+        {focusTasks.length === 0 ? (
+          <View style={styles.emptyFocusCard}>
+            <Text style={styles.emptyFocusText}>No tasks due today. You're all caught up! 🎉</Text>
           </View>
         ) : (
-          events.slice(0, 5).map((event) => {
-            const startDate = new Date(event.start);
-            const isToday = startDate.toDateString() === new Date().toDateString();
-            const dateStr = isToday 
-              ? `Today at ${startDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-              : startDate.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-            
+          focusTasks.map(task => {
+            const priorityColor = task.priority ? PRIORITY_COLORS[task.priority] : PRIORITY_COLORS.medium;
+            const timeStr = task.scheduled_time 
+              ? task.scheduled_time.substring(0, 5)
+              : '';
+
             return (
-              <View key={event.id} style={[styles.card, { borderLeftWidth: 4, borderLeftColor: event.color || '#6366f1' }]}>
-                <Text style={styles.cardTitle}>{event.title}</Text>
-                <Text style={styles.cardSubtitle}>📅 {dateStr}</Text>
-                {event.location && (
-                  <Text style={styles.cardSubtitle}>📍 {event.location}</Text>
-                )}
-              </View>
+              <TouchableOpacity
+                key={task.id}
+                style={[styles.focusCard, { borderLeftColor: priorityColor }]}
+                onPress={() => navigation?.navigate('Tasks')}
+              >
+                <View style={styles.focusCardContent}>
+                  <Text style={styles.focusTaskTitle}>{task.title}</Text>
+                  <View style={styles.focusTaskMeta}>
+                    {timeStr && (
+                      <Text style={styles.focusTaskTime}>⏰ {timeStr}</Text>
+                    )}
+                    <Text style={styles.focusTaskDuration}>
+                      ⏱️ {formatDuration(task.estimated_duration_minutes)}
+                    </Text>
+                    {task.location && (
+                      <Text style={styles.focusTaskLocation} numberOfLines={1}>
+                        📍 {task.location}
+                      </Text>
+                    )}
+                  </View>
+                </View>
+                <View style={[styles.priorityBadge, { backgroundColor: priorityColor }]}>
+                  <Text style={styles.priorityBadgeText}>
+                    {task.priority?.toUpperCase() || 'MED'}
+                  </Text>
+                </View>
+              </TouchableOpacity>
             );
           })
         )}
+      </View>
+
+      {/* Need Help Planning Section */}
+      <View style={styles.helpSection}>
+        <Text style={styles.helpTitle}>Need help planning your day?</Text>
+        <Text style={styles.helpSubtitle}>Ask Clarity to break down tasks or schedule your activities</Text>
+        <TouchableOpacity
+          style={styles.chatButton}
+          onPress={() => navigation?.navigate('Chat')}
+        >
+          <Text style={styles.chatButtonText}>Chat with Clarity</Text>
+        </TouchableOpacity>
       </View>
     </ScrollView>
   );
@@ -641,25 +935,35 @@ const HomeScreen: React.FC = () => {
 // CALENDAR SCREEN
 // ============================================================================
 
-const CalendarScreen: React.FC = () => {
+const CalendarScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [addEventModalVisible, setAddEventModalVisible] = useState(false);
+  const [addTaskModalVisible, setAddTaskModalVisible] = useState(false);
+  const [calendarView, setCalendarView] = useState<'daily' | '3day' | 'weekly' | 'monthly'>('weekly');
   const [currentWeekStart, setCurrentWeekStart] = useState(() => {
     const now = new Date();
     const day = now.getDay();
     const diff = now.getDate() - day; // Start on Sunday
     return new Date(now.setDate(diff));
   });
-  const [newEvent, setNewEvent] = useState({
-    title: '',
-    description: '',
-    location: '',
-    start_time: new Date(),
-    end_time: new Date(Date.now() + 3600000),
-  });
+  const [currentDate, setCurrentDate] = useState(new Date());
   const isFocused = useIsFocused();
+
+  // Load calendar view preference
+  useEffect(() => {
+    const loadViewPreference = async () => {
+      try {
+        const savedView = await AsyncStorage.getItem('calendarView');
+        if (savedView && ['daily', '3day', 'weekly', 'monthly'].includes(savedView)) {
+          setCalendarView(savedView as any);
+        }
+      } catch (error) {
+        console.error('Error loading calendar view preference:', error);
+      }
+    };
+    loadViewPreference();
+  }, []);
 
   useEffect(() => {
     fetchEvents();
@@ -681,40 +985,6 @@ const CalendarScreen: React.FC = () => {
     } finally {
       setLoading(false);
       setRefreshing(false);
-    }
-  };
-
-  const handleAddEvent = async () => {
-    if (!newEvent.title.trim()) {
-      Alert.alert('Error', 'Enter event title');
-      return;
-    }
-
-    try {
-      const eventData = {
-        title: newEvent.title,
-        description: newEvent.description,
-        location: newEvent.location,
-        start_time: newEvent.start_time.toISOString(),
-        end_time: newEvent.end_time.toISOString(),
-        all_day: false,
-        color: '#6366f1',
-      };
-
-      await api.post('/events/create/', eventData);
-      Alert.alert('Success', 'Event created!');
-      setAddEventModalVisible(false);
-      setNewEvent({
-        title: '',
-        description: '',
-        location: '',
-        start_time: new Date(),
-        end_time: new Date(Date.now() + 3600000),
-      });
-      await fetchEvents();
-    } catch (error: any) {
-      console.error('Create event error:', error);
-      Alert.alert('Error', 'Failed to create event');
     }
   };
 
@@ -748,6 +1018,15 @@ const CalendarScreen: React.FC = () => {
     }
   };
 
+  const handleViewChange = async (view: 'daily' | '3day' | 'weekly' | 'monthly') => {
+    setCalendarView(view);
+    try {
+      await AsyncStorage.setItem('calendarView', view);
+    } catch (error) {
+      console.error('Error saving calendar view preference:', error);
+    }
+  };
+
   const getWeekDays = () => {
     const days = [];
     for (let i = 0; i < 7; i++) {
@@ -756,6 +1035,97 @@ const CalendarScreen: React.FC = () => {
       days.push(day);
     }
     return days;
+  };
+
+  const getDaysForView = () => {
+    const days = [];
+    
+    if (calendarView === 'monthly') {
+      // Get all days in the month
+      const year = currentDate.getFullYear();
+      const month = currentDate.getMonth();
+      const firstDay = new Date(year, month, 1);
+      const lastDay = new Date(year, month + 1, 0);
+      const startDay = firstDay.getDay(); // Day of week (0 = Sunday)
+      
+      // Add previous month's days to fill the first week
+      for (let i = startDay - 1; i >= 0; i--) {
+        const day = new Date(firstDay);
+        day.setDate(day.getDate() - (i + 1));
+        days.push(day);
+      }
+      
+      // Add all days in current month
+      for (let i = 1; i <= lastDay.getDate(); i++) {
+        days.push(new Date(year, month, i));
+      }
+      
+      // Add next month's days to complete the grid (6 weeks)
+      const remainingDays = 42 - days.length; // 6 rows × 7 days
+      for (let i = 1; i <= remainingDays; i++) {
+        const day = new Date(lastDay);
+        day.setDate(day.getDate() + i);
+        days.push(day);
+      }
+    } else if (calendarView === '3day') {
+      // Yesterday, Today, Tomorrow
+      const yesterday = new Date(currentDate);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const today = new Date(currentDate);
+      const tomorrow = new Date(currentDate);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      days.push(yesterday, today, tomorrow);
+    } else if (calendarView === 'weekly') {
+      // Week view (Sunday to Saturday)
+      for (let i = 0; i < 7; i++) {
+        const day = new Date(currentWeekStart);
+        day.setDate(currentWeekStart.getDate() + i);
+        days.push(day);
+      }
+    } else {
+      // Daily view
+      days.push(new Date(currentDate));
+    }
+    
+    return days;
+  };
+
+  const navigateView = (direction: 'prev' | 'next') => {
+    if (calendarView === 'weekly') {
+      const newStart = new Date(currentWeekStart);
+      newStart.setDate(newStart.getDate() + (direction === 'next' ? 7 : -7));
+      setCurrentWeekStart(newStart);
+    } else if (calendarView === 'monthly') {
+      const newDate = new Date(currentDate);
+      newDate.setMonth(newDate.getMonth() + (direction === 'next' ? 1 : -1));
+      setCurrentDate(newDate);
+    } else {
+      const newDate = new Date(currentDate);
+      const increment = calendarView === 'daily' ? 1 : 3;
+      newDate.setDate(newDate.getDate() + (direction === 'next' ? increment : -increment));
+      setCurrentDate(newDate);
+    }
+  };
+
+  const getViewTitle = () => {
+    if (calendarView === 'monthly') {
+      return currentDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    } else if (calendarView === 'weekly') {
+      const weekDays = getWeekDays();
+      const start = currentWeekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const end = weekDays[6].toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      return `${start} - ${end}`;
+    } else if (calendarView === '3day') {
+      const yesterday = new Date(currentDate);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const tomorrow = new Date(currentDate);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const start = yesterday.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const end = tomorrow.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      return `${start} - ${end}`;
+    } else {
+      return currentDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    }
   };
 
   const getEventsForDay = (day: Date) => {
@@ -769,17 +1139,16 @@ const CalendarScreen: React.FC = () => {
     });
   };
 
-  const navigateWeek = (direction: 'prev' | 'next') => {
-    const newStart = new Date(currentWeekStart);
-    newStart.setDate(newStart.getDate() + (direction === 'next' ? 7 : -7));
-    setCurrentWeekStart(newStart);
-  };
+
 
   const goToToday = () => {
     const now = new Date();
-    const day = now.getDay();
-    const diff = now.getDate() - day;
-    setCurrentWeekStart(new Date(now.setDate(diff)));
+    setCurrentDate(now);
+    if (calendarView === 'weekly') {
+      const day = now.getDay();
+      const diff = now.getDate() - day;
+      setCurrentWeekStart(new Date(now.setDate(diff)));
+    }
   };
 
   const isToday = (date: Date) => {
@@ -799,91 +1168,245 @@ const CalendarScreen: React.FC = () => {
     );
   }
 
-  const weekDays = getWeekDays();
-  const weekStart = currentWeekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  const weekEnd = weekDays[6].toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const daysToShow = getDaysForView();
 
   return (
     <View style={styles.container}>
-      {/* Header with Week Navigation */}
-      <View style={{ backgroundColor: '#6366f1', paddingTop: 50, paddingBottom: 15 }}>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 20 }}>
-          <TouchableOpacity onPress={() => navigateWeek('prev')} style={{ padding: 10 }}>
-            <Text style={{ color: '#fff', fontSize: 24 }}>‹</Text>
+      {/* Calendar Header */}
+      <View style={styles.calendarHeader}>
+        <View style={{ paddingHorizontal: 20, paddingBottom: 12 }}>
+          <Text style={styles.calendarHeaderTitle}>Calendar 📅</Text>
+          <Text style={styles.calendarHeaderSubtitle}>Your schedule at a glance</Text>
+        </View>
+        
+        {/* View Selector */}
+        <View style={styles.viewSelector}>
+          <TouchableOpacity 
+            style={[styles.viewButton, calendarView === 'daily' && styles.viewButtonActive]}
+            onPress={() => handleViewChange('daily')}
+          >
+            <Text style={[styles.viewButtonText, calendarView === 'daily' && styles.viewButtonTextActive]}>Day</Text>
           </TouchableOpacity>
-          <View style={{ alignItems: 'center' }}>
-            <Text style={{ color: '#fff', fontSize: 18, fontWeight: '600' }}>{weekStart} - {weekEnd}</Text>
-            <TouchableOpacity onPress={goToToday}>
-              <Text style={{ color: '#cbd5e1', fontSize: 13, marginTop: 3 }}>Today</Text>
+          <TouchableOpacity 
+            style={[styles.viewButton, calendarView === '3day' && styles.viewButtonActive]}
+            onPress={() => handleViewChange('3day')}
+          >
+            <Text style={[styles.viewButtonText, calendarView === '3day' && styles.viewButtonTextActive]}>3 Day</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.viewButton, calendarView === 'weekly' && styles.viewButtonActive]}
+            onPress={() => handleViewChange('weekly')}
+          >
+            <Text style={[styles.viewButtonText, calendarView === 'weekly' && styles.viewButtonTextActive]}>Week</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.viewButton, calendarView === 'monthly' && styles.viewButtonActive]}
+            onPress={() => handleViewChange('monthly')}
+          >
+            <Text style={[styles.viewButtonText, calendarView === 'monthly' && styles.viewButtonTextActive]}>Month</Text>
+          </TouchableOpacity>
+        </View>
+        
+        {/* Date Navigation */}
+        <View style={{ paddingHorizontal: 20, paddingBottom: 15 }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <TouchableOpacity onPress={() => navigateView('prev')} style={{ padding: 10 }}>
+              <Text style={{ color: '#fff', fontSize: 24 }}>‹</Text>
+            </TouchableOpacity>
+            <View style={{ alignItems: 'center' }}>
+              <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>{getViewTitle()}</Text>
+              <TouchableOpacity onPress={goToToday}>
+                <Text style={{ color: '#cbd5e1', fontSize: 13, marginTop: 3 }}>Today</Text>
+              </TouchableOpacity>
+            </View>
+            <TouchableOpacity onPress={() => navigateView('next')} style={{ padding: 10 }}>
+              <Text style={{ color: '#fff', fontSize: 24 }}>›</Text>
             </TouchableOpacity>
           </View>
-          <TouchableOpacity onPress={() => navigateWeek('next')} style={{ padding: 10 }}>
-            <Text style={{ color: '#fff', fontSize: 24 }}>›</Text>
-          </TouchableOpacity>
         </View>
       </View>
 
-      {/* Week View Grid */}
-      <ScrollView 
-        style={{ flex: 1 }}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); fetchEvents(); }} />}
-      >
-        {weekDays.map((day, index) => {
-          const dayEvents = getEventsForDay(day);
-          const dayName = day.toLocaleDateString('en-US', { weekday: 'short' });
-          const dayNum = day.getDate();
+      {/* Calendar View Grid */}
+      {calendarView === 'monthly' ? (
+        // Monthly Grid View
+        <ScrollView 
+          style={{ flex: 1, backgroundColor: '#fff' }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); fetchEvents(); }} />}
+        >
+          {/* Weekday Headers */}
+          <View style={styles.monthWeekdayHeader}>
+            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day, idx) => (
+              <View key={idx} style={styles.monthWeekdayCell}>
+                <Text style={styles.monthWeekdayText}>{day}</Text>
+              </View>
+            ))}
+          </View>
           
-          return (
-            <View key={index} style={{ borderBottomWidth: 1, borderBottomColor: '#e5e7eb' }}>
-              {/* Day Header */}
-              <View style={{
-                flexDirection: 'row',
-                paddingVertical: 12,
-                paddingHorizontal: 15,
-                backgroundColor: isToday(day) ? '#eff6ff' : '#fff',
-                borderLeftWidth: isToday(day) ? 3 : 0,
-                borderLeftColor: '#6366f1',
-              }}>
-                <View style={{ width: 60 }}>
-                  <Text style={{ fontSize: 12, color: '#6b7280', fontWeight: '500' }}>{dayName}</Text>
-                  <Text style={{ fontSize: 20, color: isToday(day) ? '#6366f1' : '#111827', fontWeight: '600' }}>{dayNum}</Text>
+          {/* Month Grid */}
+          <View style={styles.monthGrid}>
+            {daysToShow.map((day, index) => {
+              const dayEvents = getEventsForDay(day);
+              const isCurrentMonth = day.getMonth() === currentDate.getMonth();
+              const isTodayDate = isToday(day);
+              
+              return (
+                <TouchableOpacity
+                  key={index}
+                  style={styles.monthDayCell}
+                  onPress={() => {
+                    setCurrentDate(day);
+                    handleViewChange('daily');
+                  }}
+                >
+                  <View style={[
+                    styles.monthDayNumber,
+                    isTodayDate && styles.monthDayNumberToday,
+                  ]}>
+                    <Text style={[
+                      styles.monthDayText,
+                      !isCurrentMonth && styles.monthDayTextOther,
+                      isTodayDate && styles.monthDayTextToday,
+                    ]}>
+                      {day.getDate()}
+                    </Text>
+                  </View>
+                  <View style={styles.monthEventDots}>
+                    {dayEvents.slice(0, 3).map((event, idx) => (
+                      <View
+                        key={idx}
+                        style={[
+                          styles.monthEventDot,
+                          { backgroundColor: event.color || '#6366f1' },
+                        ]}
+                      />
+                    ))}
+                    {dayEvents.length > 3 && (
+                      <Text style={styles.monthEventMore}>+{dayEvents.length - 3}</Text>
+                    )}
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </ScrollView>
+      ) : (
+        // Day/3-Day/Week Timeline View (Google Calendar Style)
+        <ScrollView 
+          style={{ flex: 1, backgroundColor: '#fff' }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); fetchEvents(); }} />}
+        >
+          {/* Day Headers */}
+          <View style={styles.dayHeadersRow}>
+            <View style={{ width: 50 }} />
+            {daysToShow.map((day, index) => {
+              const dayName = day.toLocaleDateString('en-US', { weekday: 'short' });
+              const dayNum = day.getDate();
+              const isTodayDate = isToday(day);
+              
+              return (
+                <View key={index} style={styles.dayHeader}>
+                  <Text style={[styles.dayHeaderWeekday, isTodayDate && styles.dayHeaderWeekdayToday]}>
+                    {dayName}
+                  </Text>
+                  <View style={[styles.dayHeaderNumber, isTodayDate && styles.dayHeaderNumberToday]}>
+                    <Text style={[styles.dayHeaderNumberText, isTodayDate && styles.dayHeaderNumberTextToday]}>
+                      {dayNum}
+                    </Text>
+                  </View>
                 </View>
-                <View style={{ flex: 1 }}>
-                  {dayEvents.length === 0 ? (
-                    <Text style={{ fontSize: 13, color: '#9ca3af', fontStyle: 'italic', marginTop: 8 }}>No events</Text>
-                  ) : (
-                    dayEvents.map((event, idx) => {
-                      const startTime = new Date(event.start).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-                      const endTime = new Date(event.end).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+              );
+            })}
+          </View>
+          
+          {/* Timeline Grid with Time Column */}
+          <View style={{ flexDirection: 'row' }}>
+            {/* Time Column */}
+            <View style={styles.timeColumn}>
+              {Array.from({ length: 24 }, (_, hour) => (
+                <View key={hour} style={styles.timeSlot}>
+                  <Text style={styles.timeLabel}>
+                    {hour === 0 ? '12a' : hour < 12 ? `${hour}a` : hour === 12 ? '12p' : `${hour - 12}p`}
+                  </Text>
+                </View>
+              ))}
+            </View>
+            
+            {/* Days Grid */}
+            <View style={{ flex: 1, flexDirection: 'row' }}>
+              {daysToShow.map((day, dayIndex) => (
+                <View key={dayIndex} style={styles.dayColumn}>
+                  {/* Hour Rows */}
+                  {Array.from({ length: 24 }, (_, hour) => (
+                    <View key={hour} style={styles.hourRow}>
+                      <View style={styles.hourLine} />
+                    </View>
+                  ))}
+                  
+                  {/* Events positioned absolutely */}
+                  <View style={styles.eventsContainer}>
+                    {getEventsForDay(day).map((event, idx) => {
+                      const startDate = new Date(event.start);
+                      const endDate = new Date(event.end);
+                      const startHour = startDate.getHours() + startDate.getMinutes() / 60;
+                      const endHour = endDate.getHours() + endDate.getMinutes() / 60;
+                      const duration = endHour - startHour;
+                      const top = startHour * 60; // 60px per hour
+                      const height = Math.max(duration * 60, 30); // minimum 30px
+                      
+                      const priorityColor = event.priority ? PRIORITY_COLORS[event.priority] : null;
+                      const isCompleted = event.status === 'done';
                       
                       return (
                         <TouchableOpacity
                           key={idx}
-                          onLongPress={() => handleDeleteEvent(event.id)}
-                          style={{
-                            backgroundColor: event.color || '#6366f1',
-                            borderRadius: 6,
-                            padding: 8,
-                            marginBottom: idx < dayEvents.length - 1 ? 6 : 0,
+                          onPress={() => {
+                            if (event.task_id && navigation) {
+                              navigation.navigate('Tasks', { scrollToTaskId: event.task_id });
+                            }
                           }}
+                          onLongPress={() => handleDeleteEvent(event.id)}
+                          style={[
+                            styles.timelineEvent,
+                            {
+                              top,
+                              height,
+                              backgroundColor: event.color || '#6366f1',
+                              borderLeftWidth: priorityColor ? 4 : 0,
+                              borderLeftColor: priorityColor || 'transparent',
+                              opacity: isCompleted ? 0.6 : 1,
+                            },
+                          ]}
                         >
-                          <Text style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}>{event.title}</Text>
-                          <Text style={{ color: '#e0e7ff', fontSize: 11, marginTop: 2 }}>
-                            {startTime} - {endTime}
+                          <Text style={[
+                            styles.timelineEventTitle,
+                            { textDecorationLine: isCompleted ? 'line-through' : 'none' },
+                          ]}>
+                            {event.title}
                           </Text>
-                          {event.location && (
-                            <Text style={{ color: '#e0e7ff', fontSize: 11, marginTop: 1 }}>📍 {event.location}</Text>
+                          <Text style={[
+                            styles.timelineEventTime,
+                            { textDecorationLine: isCompleted ? 'line-through' : 'none' },
+                          ]}>
+                            {startDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
+                          </Text>
+                          {event.location && height > 50 && (
+                            <Text style={[
+                              styles.timelineEventLocation,
+                              { textDecorationLine: isCompleted ? 'line-through' : 'none' },
+                            ]}>
+                              📍 {event.location}
+                            </Text>
                           )}
                         </TouchableOpacity>
                       );
-                    })
-                  )}
+                    })}
+                  </View>
                 </View>
-              </View>
+              ))}
             </View>
-          );
-        })}
-      </ScrollView>
+          </View>
+        </ScrollView>
+      )}
 
       {/* Floating Add Button */}
       <TouchableOpacity
@@ -903,254 +1426,20 @@ const CalendarScreen: React.FC = () => {
           shadowOpacity: 0.25,
           shadowRadius: 4,
         }}
-        onPress={() => setAddEventModalVisible(true)}
+        onPress={() => setAddTaskModalVisible(true)}
       >
         <Text style={{ color: '#fff', fontSize: 28, fontWeight: '300' }}>+</Text>
       </TouchableOpacity>
 
-      {/* Add Event Modal - With Date/Time Picker */}
-      <Modal
-        visible={addEventModalVisible}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setAddEventModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <ScrollView contentContainerStyle={{ justifyContent: 'center', flex: 1 }}>
-            <View style={[styles.modalContent, { width: '90%', maxWidth: 400, alignSelf: 'center' }]}>
-              <Text style={styles.modalTitle}>New Event</Text>
-
-              <TextInput
-                style={styles.input}
-                placeholder="Title *"
-                value={newEvent.title}
-                onChangeText={(text) => setNewEvent({ ...newEvent, title: text })}
-              />
-
-              <TextInput
-                style={styles.input}
-                placeholder="Location"
-                value={newEvent.location}
-                onChangeText={(text) => setNewEvent({ ...newEvent, location: text })}
-              />
-
-              {/* Date Selection with Scroll Wheels */}
-              <Text style={{ fontSize: 14, fontWeight: '600', color: '#374151', marginTop: 16, marginBottom: 8 }}>Date</Text>
-              <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', justifyContent: 'center' }}>
-                {/* Month Picker */}
-                <View style={{ flex: 1 }}>
-                  <ScrollView style={{ maxHeight: 120, borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8, backgroundColor: '#f9fafb' }}>
-                    {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].map((month, index) => (
-                      <TouchableOpacity
-                        key={month}
-                        style={{
-                          padding: 12,
-                          backgroundColor: newEvent.start_time.getMonth() === index ? '#6366f1' : 'transparent',
-                          borderBottomWidth: 1,
-                          borderBottomColor: '#e5e7eb',
-                        }}
-                        onPress={() => {
-                          const date = new Date(newEvent.start_time);
-                          date.setMonth(index);
-                          const endDate = new Date(date);
-                          endDate.setHours(date.getHours() + 1);
-                          setNewEvent({ ...newEvent, start_time: date, end_time: endDate });
-                        }}
-                      >
-                        <Text style={{ textAlign: 'center', color: newEvent.start_time.getMonth() === index ? '#fff' : '#374151', fontWeight: newEvent.start_time.getMonth() === index ? '600' : '400' }}>
-                          {month}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                  <Text style={{ textAlign: 'center', fontSize: 12, color: '#6b7280', marginTop: 4 }}>Month</Text>
-                </View>
-
-                {/* Day Picker */}
-                <View style={{ flex: 1 }}>
-                  <ScrollView style={{ maxHeight: 120, borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8, backgroundColor: '#f9fafb' }}>
-                    {Array.from({ length: 31 }, (_, i) => i + 1).map(day => (
-                      <TouchableOpacity
-                        key={day}
-                        style={{
-                          padding: 12,
-                          backgroundColor: newEvent.start_time.getDate() === day ? '#6366f1' : 'transparent',
-                          borderBottomWidth: 1,
-                          borderBottomColor: '#e5e7eb',
-                        }}
-                        onPress={() => {
-                          const date = new Date(newEvent.start_time);
-                          date.setDate(day);
-                          const endDate = new Date(date);
-                          endDate.setHours(date.getHours() + 1);
-                          setNewEvent({ ...newEvent, start_time: date, end_time: endDate });
-                        }}
-                      >
-                        <Text style={{ textAlign: 'center', color: newEvent.start_time.getDate() === day ? '#fff' : '#374151', fontWeight: newEvent.start_time.getDate() === day ? '600' : '400' }}>
-                          {day}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                  <Text style={{ textAlign: 'center', fontSize: 12, color: '#6b7280', marginTop: 4 }}>Day</Text>
-                </View>
-
-                {/* Year Picker */}
-                <View style={{ flex: 1 }}>
-                  <ScrollView style={{ maxHeight: 120, borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8, backgroundColor: '#f9fafb' }}>
-                    {Array.from({ length: 3 }, (_, i) => new Date().getFullYear() + i).map(year => (
-                      <TouchableOpacity
-                        key={year}
-                        style={{
-                          padding: 12,
-                          backgroundColor: newEvent.start_time.getFullYear() === year ? '#6366f1' : 'transparent',
-                          borderBottomWidth: 1,
-                          borderBottomColor: '#e5e7eb',
-                        }}
-                        onPress={() => {
-                          const date = new Date(newEvent.start_time);
-                          date.setFullYear(year);
-                          const endDate = new Date(date);
-                          endDate.setHours(date.getHours() + 1);
-                          setNewEvent({ ...newEvent, start_time: date, end_time: endDate });
-                        }}
-                      >
-                        <Text style={{ textAlign: 'center', color: newEvent.start_time.getFullYear() === year ? '#fff' : '#374151', fontWeight: newEvent.start_time.getFullYear() === year ? '600' : '400' }}>
-                          {year}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                  <Text style={{ textAlign: 'center', fontSize: 12, color: '#6b7280', marginTop: 4 }}>Year</Text>
-                </View>
-              </View>
-
-              <Text style={{ fontSize: 14, color: '#111827', fontWeight: '600', textAlign: 'center', marginTop: 12 }}>
-                {newEvent.start_time.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
-              </Text>
-
-              {/* Time Selection */}
-              <Text style={{ fontSize: 14, fontWeight: '600', color: '#374151', marginTop: 16, marginBottom: 8 }}>Start Time</Text>
-              <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', justifyContent: 'center' }}>
-                {/* Hour picker */}
-                <View style={{ flex: 1 }}>
-                  <ScrollView style={{ maxHeight: 120, borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8, backgroundColor: '#f9fafb' }}>
-                    {Array.from({ length: 24 }, (_, i) => i).map(hour => (
-                      <TouchableOpacity
-                        key={hour}
-                        style={{
-                          padding: 12,
-                          backgroundColor: newEvent.start_time.getHours() === hour ? '#6366f1' : 'transparent',
-                          borderBottomWidth: 1,
-                          borderBottomColor: '#e5e7eb',
-                        }}
-                        onPress={() => {
-                          const date = new Date(newEvent.start_time);
-                          date.setHours(hour);
-                          const endDate = new Date(date);
-                          endDate.setHours(hour + 1);
-                          setNewEvent({ ...newEvent, start_time: date, end_time: endDate });
-                        }}
-                      >
-                        <Text style={{ textAlign: 'center', color: newEvent.start_time.getHours() === hour ? '#fff' : '#374151', fontWeight: newEvent.start_time.getHours() === hour ? '600' : '400' }}>
-                          {hour.toString().padStart(2, '0')}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                  <Text style={{ textAlign: 'center', fontSize: 12, color: '#6b7280', marginTop: 4 }}>Hour</Text>
-                </View>
-
-                <Text style={{ fontSize: 20, color: '#6b7280' }}>:</Text>
-
-                {/* Minute picker */}
-                <View style={{ flex: 1 }}>
-                  <ScrollView style={{ maxHeight: 120, borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8, backgroundColor: '#f9fafb' }}>
-                    {[0, 15, 30, 45].map(minute => (
-                      <TouchableOpacity
-                        key={minute}
-                        style={{
-                          padding: 12,
-                          backgroundColor: newEvent.start_time.getMinutes() === minute ? '#6366f1' : 'transparent',
-                          borderBottomWidth: 1,
-                          borderBottomColor: '#e5e7eb',
-                        }}
-                        onPress={() => {
-                          const date = new Date(newEvent.start_time);
-                          date.setMinutes(minute);
-                          date.setSeconds(0);
-                          const endDate = new Date(date);
-                          endDate.setHours(date.getHours() + 1);
-                          setNewEvent({ ...newEvent, start_time: date, end_time: endDate });
-                        }}
-                      >
-                        <Text style={{ textAlign: 'center', color: newEvent.start_time.getMinutes() === minute ? '#fff' : '#374151', fontWeight: newEvent.start_time.getMinutes() === minute ? '600' : '400' }}>
-                          {minute.toString().padStart(2, '0')}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                  <Text style={{ textAlign: 'center', fontSize: 12, color: '#6b7280', marginTop: 4 }}>Minute</Text>
-                </View>
-              </View>
-
-              {/* Duration Selection */}
-              <Text style={{ fontSize: 14, fontWeight: '600', color: '#374151', marginTop: 16, marginBottom: 8 }}>Duration</Text>
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <TouchableOpacity
-                  style={[styles.button, { flex: 1, backgroundColor: '#8b5cf6', padding: 10 }]}
-                  onPress={() => {
-                    const endDate = new Date(newEvent.start_time);
-                    endDate.setMinutes(endDate.getMinutes() + 30);
-                    setNewEvent({ ...newEvent, end_time: endDate });
-                  }}
-                >
-                  <Text style={[styles.buttonText, { fontSize: 13 }]}>30min</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.button, { flex: 1, backgroundColor: '#8b5cf6', padding: 10 }]}
-                  onPress={() => {
-                    const endDate = new Date(newEvent.start_time);
-                    endDate.setHours(endDate.getHours() + 1);
-                    setNewEvent({ ...newEvent, end_time: endDate });
-                  }}
-                >
-                  <Text style={[styles.buttonText, { fontSize: 13 }]}>1hr</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.button, { flex: 1, backgroundColor: '#8b5cf6', padding: 10 }]}
-                  onPress={() => {
-                    const endDate = new Date(newEvent.start_time);
-                    endDate.setHours(endDate.getHours() + 2);
-                    setNewEvent({ ...newEvent, end_time: endDate });
-                  }}
-                >
-                  <Text style={[styles.buttonText, { fontSize: 13 }]}>2hr</Text>
-                </TouchableOpacity>
-              </View>
-
-              <Text style={{ fontSize: 13, color: '#6b7280', marginTop: 12, textAlign: 'center' }}>
-                Ends: {newEvent.end_time.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
-              </Text>
-
-              <View style={{ flexDirection: 'row', gap: 10, marginTop: 24 }}>
-                <TouchableOpacity
-                  style={[styles.button, styles.primaryButton, { flex: 1 }]}
-                  onPress={handleAddEvent}
-                >
-                  <Text style={styles.buttonText}>Create</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.button, { flex: 1, backgroundColor: '#6b7280' }]}
-                  onPress={() => setAddEventModalVisible(false)}
-                >
-                  <Text style={styles.buttonText}>Cancel</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </ScrollView>
-        </View>
-      </Modal>
+      {/* Add Task Modal */}
+      <AddTaskModal
+        visible={addTaskModalVisible}
+        onClose={() => setAddTaskModalVisible(false)}
+        onTaskCreated={() => {
+          setAddTaskModalVisible(false);
+          fetchEvents(); // Refresh calendar after task creation
+        }}
+      />
     </View>
   );
 };
@@ -1159,7 +1448,7 @@ const CalendarScreen: React.FC = () => {
 // TASKS SCREEN
 // ============================================================================
 
-const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
+const TasksScreen: React.FC<{ navigation?: any; route?: any }> = ({ navigation, route }) => {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [loading, setLoading] = useState(true);
@@ -1170,6 +1459,8 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
   const [addTaskModalVisible, setAddTaskModalVisible] = useState(false);
   const [editTaskModalVisible, setEditTaskModalVisible] = useState(false);
   const [taskToEdit, setTaskToEdit] = useState<Task | null>(null);
+  const taskScrollViewRef = React.useRef<ScrollView>(null);
+  const taskRefs = React.useRef<{ [key: number]: View | null }>({});
   
   // Date navigation
   const [selectedDate, setSelectedDate] = useState(new Date());
@@ -1211,6 +1502,45 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
     }
   }, [isFocused]);
 
+  // Handle navigation from calendar - scroll to specific task
+  useEffect(() => {
+    if (route?.params?.scrollToTaskId && tasks.length > 0) {
+      const taskId = route.params.scrollToTaskId;
+      
+      // Find the task and its scheduled date
+      const task = tasks.find(t => t.id === taskId);
+      if (task && task.scheduled_date) {
+        // Parse date string to avoid timezone issues
+        // scheduled_date is in format "YYYY-MM-DD"
+        const [year, month, day] = task.scheduled_date.split('-').map(Number);
+        const taskDate = new Date(year, month - 1, day); // month is 0-indexed
+        setSelectedDate(taskDate);
+      }
+      
+      // Expand the task
+      setExpandedTasks(new Set([taskId]));
+      
+      // Scroll to the task after a short delay to ensure render is complete
+      setTimeout(() => {
+        const taskRef = taskRefs.current[taskId];
+        if (taskRef && taskScrollViewRef.current) {
+          taskRef.measureLayout(
+            taskScrollViewRef.current as any,
+            (x, y) => {
+              taskScrollViewRef.current?.scrollTo({ y: y - 100, animated: true });
+            },
+            () => {}
+          );
+        }
+      }, 500);
+      
+      // Clear the navigation param
+      if (route.params) {
+        route.params.scrollToTaskId = undefined;
+      }
+    }
+  }, [route?.params?.scrollToTaskId, tasks]);
+
   // Update current time every minute for "Active" status
   useEffect(() => {
     const timer = setInterval(() => {
@@ -1218,6 +1548,52 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
     }, 60000); // Update every minute
     return () => clearInterval(timer);
   }, []);
+
+  // Sync scheduled tasks to calendar events every minute
+  useEffect(() => {
+    const syncTasksToCalendar = async () => {
+      try {
+        const scheduledTasks = tasks.filter(task => 
+          task.scheduled_date && 
+          task.scheduled_time && 
+          task.status !== 'done' &&
+          !task.calendar_event_id
+        );
+
+        if (scheduledTasks.length === 0) return;
+
+        console.log(`📅 Syncing ${scheduledTasks.length} scheduled tasks to calendar...`);
+
+        for (const task of scheduledTasks) {
+          try {
+            // Create calendar event for this task
+            const eventData = {
+              task_id: task.id,
+              date: task.scheduled_date,
+              time: task.scheduled_time,
+            };
+
+            await api.post('/tasks/schedule/', eventData);
+            console.log(`✅ Synced task "${task.title}" to calendar`);
+          } catch (error) {
+            console.error(`❌ Failed to sync task "${task.title}":`, error);
+          }
+        }
+
+        // Refresh tasks to get updated calendar_event_id values
+        await fetchTasks();
+      } catch (error) {
+        console.error('Error syncing tasks to calendar:', error);
+      }
+    };
+
+    // Run sync immediately
+    syncTasksToCalendar();
+
+    // Then run every minute
+    const timer = setInterval(syncTasksToCalendar, 60000);
+    return () => clearInterval(timer);
+  }, [tasks]);
 
   // Helper: Format date as YYYY-MM-DD
   const formatDate = (date: Date): string => {
@@ -1255,6 +1631,7 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
   // Filter tasks based on selected date and active/completed status
   const getFilteredTasks = (): Task[] => {
     const selectedDateStr = formatDate(selectedDate);
+    console.log('🔍 Filtering tasks for date:', selectedDateStr, 'Tab:', activeTab);
     
     return tasks.filter(task => {
       // Always show unscheduled tasks
@@ -1264,7 +1641,11 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
       
       // Show tasks scheduled for selected date
       if (task.scheduled_date === selectedDateStr) {
-        return activeTab === 'active' ? task.status !== 'done' : task.status === 'done';
+        const matches = activeTab === 'active' ? task.status !== 'done' : task.status === 'done';
+        if (matches) {
+          console.log('✅ Task matches filter:', task.title, 'scheduled_date:', task.scheduled_date, 'status:', task.status);
+        }
+        return matches;
       }
       
       return false;
@@ -1307,6 +1688,12 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
   const fetchTasks = async () => {
     try {
       const response = await api.get('/tasks/');
+      console.log('📥 Fetched tasks:', response.data.length, 'tasks');
+      console.log('📅 Tasks with scheduling:', response.data.filter((t: Task) => t.scheduled_date).map((t: Task) => ({ 
+        title: t.title, 
+        scheduled_date: t.scheduled_date, 
+        scheduled_time: t.scheduled_time 
+      })));
       setTasks(response.data);
     } catch (error) {
       console.error('Error fetching tasks:', error);
@@ -1657,7 +2044,14 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
     const timeStatus = getTimeUntilStart(task);
 
     return (
-      <View key={task.id}>
+      <View 
+        key={task.id}
+        ref={(ref) => {
+          if (!isSubtask) {
+            taskRefs.current[task.id] = ref;
+          }
+        }}
+      >
         <View
           style={[
             styles.taskCard,
@@ -1671,9 +2065,6 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
             onPress={() => {
               if (hasSubtasks) {
                 toggleTaskExpansion(task.id);
-              } else if (task.status !== 'done') {
-                setSelectedTask(task);
-                setFeedbackModalVisible(true);
               }
             }}
           >
@@ -1762,7 +2153,7 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
                       onPress={() => {
                         if (navigation) {
                           navigation.navigate('Chat', {
-                            prefillMessage: `Update my task: "${task.title}". Currently scheduled for ${task.scheduled_date || 'not scheduled'} at ${task.scheduled_time?.substring(0, 5) || 'no time'}. Duration: ${formatDuration(task.estimated_duration_minutes)}. Priority: ${task.priority || 'medium'}. Location: ${task.location || 'none'}.`
+                            referencedTask: task
                           });
                         }
                       }}
@@ -1774,27 +2165,29 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
                   </View>
                 )}
                 
-                {/* Undo button for completed tasks */}
-                {!isSubtask && task.status === 'done' && (
-                  <TouchableOpacity
-                    style={{ backgroundColor: '#f59e0b', borderRadius: 6, paddingVertical: 8, paddingHorizontal: 12, marginTop: 12 }}
-                    onPress={() => handleMarkIncomplete(task)}
-                  >
-                    <Text style={{ color: '#fff', fontSize: 13, fontWeight: '600', textAlign: 'center' }}>
-                      ↩️ Mark as Incomplete
-                    </Text>
-                  </TouchableOpacity>
-                )}
+
               </View>
             </View>
           </TouchableOpacity>
           
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <View style={styles.taskStatus}>
-              <Text style={styles.taskStatusText}>
-                {task.status === 'done' ? '✅' : '⏳'}
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            {/* Checkbox for completing/uncompleting task */}
+            <TouchableOpacity
+              onPress={() => {
+                if (task.status === 'done') {
+                  handleMarkIncomplete(task);
+                } else {
+                  setSelectedTask(task);
+                  setFeedbackModalVisible(true);
+                }
+              }}
+              style={styles.checkboxButton}
+            >
+              <Text style={styles.checkboxIcon}>
+                {task.status === 'done' ? '☑️' : '⬜'}
               </Text>
-            </View>
+            </TouchableOpacity>
+            
             {task.status !== 'done' && (
               <TouchableOpacity
                 onPress={() => handleDeleteTask(task.id, task.title)}
@@ -1809,7 +2202,9 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
         {/* Render subtasks if expanded */}
         {hasSubtasks && isExpanded && (
           <View style={styles.subtasksContainer}>
-            {task.subtasks.map((subtask, index) => {
+            {[...task.subtasks]
+              .sort((a, b) => (a.order || 0) - (b.order || 0))
+              .map((subtask, index) => {
               const duration = subtask.estimated_duration_minutes || 0;
               const hours = Math.floor(duration / 60);
               const mins = duration % 60;
@@ -1841,83 +2236,64 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>Your Tasks</Text>
-        <Text style={styles.headerSubtitle}>AI-powered time estimates</Text>
+      {/* Tasks Header */}
+      <View style={styles.tasksHeader}>
+        <Text style={styles.tasksHeaderTitle}>Your Tasks ✓</Text>
+        <Text style={styles.tasksHeaderSubtitle}>AI-powered time estimates</Text>
       </View>
 
       {/* Date Navigation */}
-      <View style={{ backgroundColor: '#fff', paddingVertical: 12, paddingHorizontal: 20, borderBottomWidth: 1, borderBottomColor: '#e5e7eb' }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+      <View style={styles.dateNavigation}>
+        <View style={styles.dateNavRow}>
           <TouchableOpacity
             onPress={goToPreviousDay}
-            style={{ padding: 8, backgroundColor: '#f3f4f6', borderRadius: 8 }}
+            style={styles.dateNavButton}
           >
-            <Text style={{ fontSize: 18, fontWeight: '600', color: '#374151' }}>←</Text>
+            <Text style={styles.dateNavArrow}>←</Text>
           </TouchableOpacity>
           
-          <View style={{ alignItems: 'center', flex: 1 }}>
-            <Text style={{ fontSize: 18, fontWeight: '600', color: '#111827' }}>
+          <View style={styles.dateNavCenter}>
+            <Text style={styles.dateNavDate}>
               {isToday(selectedDate) ? 'Today' : selectedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
             </Text>
-            <Text style={{ fontSize: 13, color: '#6b7280', marginTop: 2 }}>
+            <Text style={styles.dateNavDay}>
               {selectedDate.toLocaleDateString('en-US', { weekday: 'long' })}
             </Text>
           </View>
           
           <TouchableOpacity
             onPress={goToNextDay}
-            style={{ padding: 8, backgroundColor: '#f3f4f6', borderRadius: 8 }}
+            style={styles.dateNavButton}
           >
-            <Text style={{ fontSize: 18, fontWeight: '600', color: '#374151' }}>→</Text>
+            <Text style={styles.dateNavArrow}>→</Text>
           </TouchableOpacity>
         </View>
         
         {!isToday(selectedDate) && (
           <TouchableOpacity
             onPress={goToToday}
-            style={{ marginTop: 8, paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#6366f1', borderRadius: 6, alignSelf: 'center' }}
+            style={styles.todayButton}
           >
-            <Text style={{ color: '#fff', fontSize: 13, fontWeight: '600' }}>Go to Today</Text>
+            <Text style={styles.todayButtonText}>Go to Today</Text>
           </TouchableOpacity>
         )}
       </View>
 
       {/* Active/Completed Tabs */}
-      <View style={{ flexDirection: 'row', backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e5e7eb' }}>
+      <View style={styles.taskTabs}>
         <TouchableOpacity
           onPress={() => setActiveTab('active')}
-          style={{
-            flex: 1,
-            paddingVertical: 12,
-            borderBottomWidth: 3,
-            borderBottomColor: activeTab === 'active' ? '#6366f1' : 'transparent',
-          }}
+          style={[styles.taskTab, activeTab === 'active' && styles.taskTabActive]}
         >
-          <Text style={{
-            textAlign: 'center',
-            fontSize: 15,
-            fontWeight: '600',
-            color: activeTab === 'active' ? '#6366f1' : '#9ca3af',
-          }}>
+          <Text style={[styles.taskTabText, activeTab === 'active' && styles.taskTabTextActive]}>
             Active ({getFilteredTasks().filter(t => t.status !== 'done').length})
           </Text>
         </TouchableOpacity>
         <TouchableOpacity
           onPress={() => setActiveTab('completed')}
-          style={{
-            flex: 1,
-            paddingVertical: 12,
-            borderBottomWidth: 3,
-            borderBottomColor: activeTab === 'completed' ? '#6366f1' : 'transparent',
-          }}
+          style={[styles.taskTab, activeTab === 'completed' && styles.taskTabActive]}
         >
-          <Text style={{
-            textAlign: 'center',
-            fontSize: 15,
-            fontWeight: '600',
-            color: activeTab === 'completed' ? '#6366f1' : '#9ca3af',
-          }}>
+          <Text style={[styles.taskTabText, activeTab === 'completed' && styles.taskTabTextActive]}>
             Completed ({getFilteredTasks().filter(t => t.status === 'done').length})
           </Text>
         </TouchableOpacity>
@@ -1957,7 +2333,10 @@ const TasksScreen: React.FC<{ navigation?: any }> = ({ navigation }) => {
       />
 
       {/* Tasks List */}
-      <ScrollView style={styles.tasksList}>
+      <ScrollView 
+        ref={taskScrollViewRef}
+        style={styles.tasksList}
+      >
         {getFilteredTasks().length === 0 ? (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>
@@ -2400,17 +2779,32 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [onboardingData, setOnboardingData] = useState<any>({});
   const [loading, setLoading] = useState(true);
+  const [referencedTask, setReferencedTask] = useState<Task | null>(null);
+  const flatListRef = React.useRef<any>(null);
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    if (messages.length > 0 && flatListRef.current) {
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: true });
+      }, 100);
+    }
+  }, [messages]);
 
   useEffect(() => {
     checkOnboarding();
   }, []);
 
-  // Handle prefilled message from navigation
+  // Handle task reference from navigation
   useEffect(() => {
-    if (route?.params?.prefillMessage) {
-      setInputText(route.params.prefillMessage);
+    if (route?.params?.referencedTask) {
+      setReferencedTask(route.params.referencedTask);
+      // Clear the param after setting it
+      if (route.params) {
+        route.params.referencedTask = undefined;
+      }
     }
-  }, [route?.params?.prefillMessage]);
+  }, [route?.params?.referencedTask]);
 
   const checkOnboarding = async () => {
     try {
@@ -2526,6 +2920,11 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
     setMessages((prev) => [...prev, userMessage]);
     const messageText = inputText;
     setInputText('');
+    
+    // Store task reference before clearing
+    const taskRef = referencedTask;
+    setReferencedTask(null); // Clear reference after sending
+    
     setSending(true);
 
     try {
@@ -2533,9 +2932,16 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
       if (!onboardingComplete && onboardingStep > 0) {
         await handleOnboardingResponse(messageText);
       } else {
+        // Build message with task context if referenced
+        let fullMessage = messageText;
+        if (taskRef) {
+          const taskContext = `[Editing task: "${taskRef.title}". Current details - Scheduled: ${taskRef.scheduled_date || 'not scheduled'} at ${taskRef.scheduled_time?.substring(0, 5) || 'no time'}. Duration: ${formatDuration(taskRef.estimated_duration_minutes)}. Priority: ${taskRef.priority || 'medium'}. Location: ${taskRef.location || 'none'}. ${taskRef.subtasks && taskRef.subtasks.length > 0 ? `Has ${taskRef.subtasks.length} subtasks.` : ''}] User message: ${messageText}`;
+          fullMessage = taskContext;
+        }
+        
         // Normal chat
         const response = await api.post('/chat/', {
-          message: messageText,
+          message: fullMessage,
         });
 
         const aiMessage: ChatMessage = {
@@ -2590,7 +2996,14 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
     >
+      {/* Chat Header */}
+      <View style={styles.chatHeader}>
+        <Text style={styles.chatHeaderTitle}>Chat with Clarity 💬</Text>
+        <Text style={styles.chatHeaderSubtitle}>Your AI time awareness assistant</Text>
+      </View>
+
       <FlatList
+        ref={flatListRef}
         data={messages}
         keyExtractor={(item) => item.id}
         renderItem={({ item }) => (
@@ -2611,12 +3024,30 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
           </View>
         )}
         contentContainerStyle={styles.messagesList}
+        onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
       />
+
+      {/* Referenced Task Bar */}
+      {referencedTask && (
+        <View style={styles.referenceBar}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.referenceLabel}>Task:</Text>
+            <Text style={styles.referenceTaskName}>{referencedTask.title}</Text>
+          </View>
+          <TouchableOpacity
+            onPress={() => setReferencedTask(null)}
+            style={styles.referenceCloseButton}
+          >
+            <Text style={styles.referenceCloseText}>✕</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       <View style={styles.chatInputContainer}>
         <TextInput
           style={styles.chatInput}
           placeholder="Ask Clarity anything..."
+          placeholderTextColor="#9ca3af"
           value={inputText}
           onChangeText={setInputText}
           onSubmitEditing={handleSend}
@@ -2645,14 +3076,37 @@ const ChatScreen: React.FC<{ route?: any }> = ({ route }) => {
 // ============================================================================
 
 const ProfileScreen: React.FC = () => {
-  const { user, logout } = React.useContext(AuthContext);
+  const { user, logout, updateUser } = React.useContext(AuthContext);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [preferences, setPreferences] = useState<any>({});
+  const [editingPreferences, setEditingPreferences] = useState(false);
+  const [savingPreferences, setSavingPreferences] = useState(false);
+  const [editingProfile, setEditingProfile] = useState(false);
+  const [editedUsername, setEditedUsername] = useState('');
+  const [editedFirstName, setEditedFirstName] = useState('');
+  const [editedLastName, setEditedLastName] = useState('');
+  const [profileImage, setProfileImage] = useState<string | null>(null);
+  const [refreshingMotivation, setRefreshingMotivation] = useState(false);
 
   useEffect(() => {
     fetchProfile();
   }, []);
+
+  const refreshMotivation = async () => {
+    setRefreshingMotivation(true);
+    try {
+      const response = await api.get('/profile/');
+      setAiSummary(response.data.ai_summary || null);
+      console.log('[PROFILE] Refreshed AI Summary:', response.data.ai_summary);
+    } catch (error: any) {
+      console.error('Error refreshing motivation:', error);
+      Alert.alert('Error', 'Failed to refresh motivation');
+    } finally {
+      setRefreshingMotivation(false);
+    }
+  };
 
   const fetchProfile = async () => {
     try {
@@ -2661,6 +3115,17 @@ const ProfileScreen: React.FC = () => {
       setProfile(response.data);
       setAiSummary(response.data.ai_summary || null);
       console.log('[PROFILE] AI Summary:', response.data.ai_summary);
+      
+      // Initialize edit fields
+      setEditedUsername(response.data.user.username);
+      setEditedFirstName(response.data.user.first_name || '');
+      setEditedLastName(response.data.user.last_name || '');
+      setProfileImage(response.data.user.profile_image || null);
+      
+      // Load preferences from AI memory
+      if (response.data.ai_memory && response.data.ai_memory.onboarding_data) {
+        setPreferences(response.data.ai_memory.onboarding_data);
+      }
     } catch (error: any) {
       console.error('Error fetching profile:', error);
       console.error('Response status:', error.response?.status);
@@ -2671,6 +3136,106 @@ const ProfileScreen: React.FC = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSavePreferences = async () => {
+    setSavingPreferences(true);
+    try {
+      await api.post('/ai/onboarding/', { 
+        responses: preferences,
+        onboarding_completed: true 
+      });
+      Alert.alert('Success', 'Preferences updated!');
+      setEditingPreferences(false);
+    } catch (error) {
+      console.error('[PROFILE] Error saving preferences:', error);
+      Alert.alert('Error', 'Failed to save preferences');
+    } finally {
+      setSavingPreferences(false);
+    }
+  };
+
+  const handleSaveProfile = async () => {
+    if (!editedUsername.trim()) {
+      Alert.alert('Error', 'Username cannot be empty');
+      return;
+    }
+
+    setSavingPreferences(true);
+    try {
+      const response = await api.patch('/profile/update/', {
+        username: editedUsername,
+        first_name: editedFirstName,
+        last_name: editedLastName,
+      });
+      
+      // Update the user context with new data
+      await updateUser(response.data.user);
+      
+      Alert.alert('Success', 'Profile updated!');
+      setEditingProfile(false);
+      await fetchProfile(); // Refresh profile data
+    } catch (error: any) {
+      console.error('[PROFILE] Error saving profile:', error);
+      if (error.response?.status === 400 && error.response?.data?.error?.includes('username')) {
+        Alert.alert('Error', 'Username is already taken. Please choose another.');
+      } else {
+        Alert.alert('Error', 'Failed to update profile');
+      }
+    } finally {
+      setSavingPreferences(false);
+    }
+  };
+
+  const handleSelectImage = () => {
+    Alert.alert(
+      'Profile Picture',
+      'Choose an option',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel'
+        },
+        {
+          text: 'Choose from Library',
+          onPress: () => Alert.alert('Coming Soon', 'Image upload will be available in the next update!')
+        },
+        {
+          text: 'Take Photo',
+          onPress: () => Alert.alert('Coming Soon', 'Camera feature will be available in the next update!')
+        }
+      ]
+    );
+  };
+
+  const getPreferenceLabel = (key: string, value: string): string => {
+    const labels: any = {
+      work_rhythm: {
+        early_bird: "Early Bird (5am-9am)",
+        morning_person: "Morning Person (9am-12pm)",
+        afternoon_warrior: "Afternoon Warrior (12pm-5pm)",
+        night_owl: "Night Owl (9pm-2am)"
+      },
+      break_preference: {
+        short_frequent: "Short & Sweet (5-10 min/hour)",
+        medium: "Balanced (15-20 min/2 hours)",
+        long_rare: "Long & Deep (30+ min)",
+        no_schedule: "Go with the flow"
+      },
+      work_style: {
+        sprint: "Quick Sprints (20-30 min)",
+        standard: "Standard Blocks (45-60 min)",
+        deep_dive: "Deep Dive (90+ min)",
+        flexible: "Mix it up"
+      },
+      planning_style: {
+        detailed: "Every minute planned",
+        rough_outline: "Rough outline",
+        priorities: "Just priorities",
+        spontaneous: "Wing it"
+      }
+    };
+    return labels[key]?.[value] || value;
   };
 
   const handleConnectGoogle = async () => {
@@ -2743,36 +3308,134 @@ const ProfileScreen: React.FC = () => {
 
   return (
     <ScrollView style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>Profile</Text>
+      {/* Profile Header */}
+      <View style={styles.profileHeader}>
+        <Text style={styles.profileHeaderTitle}>Your Profile 👤</Text>
+        <Text style={styles.profileHeaderSubtitle}>Manage your account and preferences</Text>
       </View>
 
-      {/* User Info */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Account</Text>
-        <View style={styles.card}>
-          <Text style={styles.profileLabel}>Username</Text>
-          <Text style={styles.profileValue}>{user?.username}</Text>
-        </View>
-        <View style={styles.card}>
-          <Text style={styles.profileLabel}>Email</Text>
-          <Text style={styles.profileValue}>{user?.email || 'Not set'}</Text>
+      {/* Profile Picture & Info Section */}
+      <View style={styles.profileSection}>
+        <View style={styles.profileCard}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 16 }}>
+            {/* Profile Picture */}
+            <TouchableOpacity 
+              onPress={handleSelectImage}
+              style={styles.profileImageContainer}
+            >
+              {profileImage ? (
+                <Text style={styles.profileImagePlaceholder}>📷</Text>
+              ) : (
+                <Text style={styles.profileImagePlaceholder}>👤</Text>
+              )}
+              <View style={styles.profileImageBadge}>
+                <Text style={styles.profileImageBadgeText}>✏️</Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* Name & Email */}
+            <View style={{ flex: 1, marginLeft: 16 }}>
+              {!editingProfile ? (
+                <>
+                  <Text style={styles.profileDisplayName}>
+                    {user?.first_name && user?.last_name 
+                      ? `${user.first_name} ${user.last_name}`
+                      : user?.username}
+                  </Text>
+                  <Text style={styles.profileDisplayEmail}>{user?.email || 'No email set'}</Text>
+                  <TouchableOpacity 
+                    onPress={() => setEditingProfile(true)}
+                    style={{ marginTop: 8 }}
+                  >
+                    <Text style={{ color: '#6366f1', fontSize: 14, fontWeight: '600' }}>✏️ Edit Profile</Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <>
+                  <TextInput
+                    style={styles.profileEditInput}
+                    value={editedFirstName}
+                    onChangeText={setEditedFirstName}
+                    placeholder="First Name"
+                    placeholderTextColor="#9ca3af"
+                  />
+                  <TextInput
+                    style={styles.profileEditInput}
+                    value={editedLastName}
+                    onChangeText={setEditedLastName}
+                    placeholder="Last Name"
+                    placeholderTextColor="#9ca3af"
+                  />
+                  <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+                    <TouchableOpacity 
+                      onPress={handleSaveProfile}
+                      style={styles.profileSaveButton}
+                      disabled={savingPreferences}
+                    >
+                      <Text style={{ color: '#fff', fontSize: 13, fontWeight: '600' }}>
+                        {savingPreferences ? 'Saving...' : '✓ Save'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity 
+                      onPress={() => {
+                        setEditingProfile(false);
+                        setEditedUsername(user?.username || '');
+                        setEditedFirstName(user?.first_name || '');
+                        setEditedLastName(user?.last_name || '');
+                      }}
+                      style={styles.profileCancelButton}
+                    >
+                      <Text style={{ color: '#6b7280', fontSize: 13, fontWeight: '600' }}>✕ Cancel</Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
+              )}
+            </View>
+          </View>
+
+          {/* Username Section */}
+          <View style={{ borderTopWidth: 1, borderTopColor: '#e5e7eb', paddingTop: 12 }}>
+            <Text style={[styles.profileLabel, { marginBottom: 8 }]}>Username (used for login)</Text>
+            {!editingProfile ? (
+              <Text style={styles.profileValue}>@{user?.username}</Text>
+            ) : (
+              <TextInput
+                style={[styles.profileEditInput, { marginTop: 0 }]}
+                value={editedUsername}
+                onChangeText={setEditedUsername}
+                placeholder="Username"
+                placeholderTextColor="#9ca3af"
+                autoCapitalize="none"
+              />
+            )}
+          </View>
         </View>
       </View>
 
-      {/* AI Insights - What AI Thinks About You */}
+      {/* AI Insights - What Clarity Thinks About You */}
       {aiSummary && (
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🤖 What AI Thinks About You</Text>
-          <View style={[styles.card, { backgroundColor: '#f0f9ff', borderLeftWidth: 4, borderLeftColor: '#6366f1' }]}>
-            <Text style={{ fontSize: 13, fontWeight: '600', color: '#6366f1', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-              Your Productivity Profile
-            </Text>
+        <View style={styles.profileSection}>
+          <Text style={styles.profileSectionTitle}>✨ What Clarity Thinks About You</Text>
+          <View style={[styles.profileCard, { backgroundColor: '#f0f9ff', borderLeftWidth: 4, borderLeftColor: '#6366f1' }]}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: '#6366f1', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                Your Daily Motivation
+              </Text>
+              <TouchableOpacity 
+                onPress={refreshMotivation}
+                disabled={refreshingMotivation}
+                style={{ padding: 4, marginRight: -4 }}
+              >
+                <Text style={{ fontSize: 20, color: refreshingMotivation ? '#9ca3af' : '#6366f1' }}>
+                  ⟳
+                </Text>
+              </TouchableOpacity>
+            </View>
             <Text style={[styles.profileValue, { fontSize: 16, lineHeight: 24, color: '#1e3a8a', fontWeight: '500' }]}>
               {aiSummary}
             </Text>
             <Text style={{ fontSize: 12, color: '#60a5fa', marginTop: 12, fontStyle: 'italic' }}>
-              💡 This insight is generated from your task patterns and updates daily
+              💡 Fresh motivation every time you log in
             </Text>
           </View>
         </View>
@@ -2780,20 +3443,209 @@ const ProfileScreen: React.FC = () => {
 
       {/* Show placeholder if no AI summary yet */}
       {!aiSummary && (
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🤖 What AI Thinks About You</Text>
-          <View style={[styles.card, { backgroundColor: '#f9fafb', borderLeftWidth: 4, borderLeftColor: '#9ca3af' }]}>
-            <Text style={{ fontSize: 15, lineHeight: 22, color: '#6b7280', textAlign: 'center', fontStyle: 'italic' }}>
-              Complete a few tasks and I'll learn your patterns to provide personalized insights! 🎯
-            </Text>
+        <View style={styles.profileSection}>
+          <Text style={styles.profileSectionTitle}>✨ What Clarity Thinks About You</Text>
+          <View style={[styles.profileCard, { backgroundColor: '#f9fafb', borderLeftWidth: 4, borderLeftColor: '#9ca3af', paddingTop: 16, paddingBottom: 16 }]}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+              <Text style={{ fontSize: 15, lineHeight: 22, color: '#6b7280', fontStyle: 'italic', flex: 1 }}>
+                Complete a few tasks and I'll share some motivating thoughts with you! 🎯
+              </Text>
+              <TouchableOpacity 
+                onPress={refreshMotivation}
+                disabled={refreshingMotivation}
+                style={{ padding: 4, marginLeft: 8 }}
+              >
+                <Text style={{ fontSize: 20, color: refreshingMotivation ? '#9ca3af' : '#6366f1' }}>
+                  ⟳
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
       )}
 
+      {/* Work Preferences */}
+      {Object.keys(preferences).length > 0 && (
+        <View style={styles.profileSection}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <Text style={styles.profileSectionTitle}>⚙️ Your Preferences</Text>
+            {!editingPreferences && (
+              <TouchableOpacity onPress={() => setEditingPreferences(true)}>
+                <Text style={{ color: '#6366f1', fontSize: 15, fontWeight: '600' }}>Edit</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          {!editingPreferences ? (
+            <>
+              <View style={styles.profileCard}>
+                <Text style={styles.profileLabel}>⏰ Most Productive Time</Text>
+                <Text style={styles.profileValue}>
+                  {getPreferenceLabel('work_rhythm', preferences.work_rhythm || '')}
+                </Text>
+              </View>
+              <View style={styles.profileCard}>
+                <Text style={styles.profileLabel}>☕ Break Style</Text>
+                <Text style={styles.profileValue}>
+                  {getPreferenceLabel('break_preference', preferences.break_preference || '')}
+                </Text>
+              </View>
+              <View style={styles.profileCard}>
+                <Text style={styles.profileLabel}>⚡ Work Session Length</Text>
+                <Text style={styles.profileValue}>
+                  {getPreferenceLabel('work_style', preferences.work_style || '')}
+                </Text>
+              </View>
+              <View style={styles.profileCard}>
+                <Text style={styles.profileLabel}>📋 Planning Style</Text>
+                <Text style={styles.profileValue}>
+                  {getPreferenceLabel('planning_style', preferences.planning_style || '')}
+                </Text>
+              </View>
+            </>
+          ) : (
+            <>
+              {/* Work Rhythm */}
+              <View style={styles.card}>
+                <Text style={[styles.profileLabel, { marginBottom: 8 }]}>⏰ Most Productive Time</Text>
+                {[
+                  { value: 'early_bird', label: "Early Bird (5am-9am)" },
+                  { value: 'morning_person', label: "Morning Person (9am-12pm)" },
+                  { value: 'afternoon_warrior', label: "Afternoon Warrior (12pm-5pm)" },
+                  { value: 'night_owl', label: "Night Owl (9pm-2am)" },
+                ].map(option => (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={[
+                      styles.preferenceOption,
+                      preferences.work_rhythm === option.value && styles.preferenceOptionSelected
+                    ]}
+                    onPress={() => setPreferences({ ...preferences, work_rhythm: option.value })}
+                  >
+                    <Text style={[
+                      styles.preferenceOptionText,
+                      preferences.work_rhythm === option.value && styles.preferenceOptionTextSelected
+                    ]}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Break Preference */}
+              <View style={styles.card}>
+                <Text style={[styles.profileLabel, { marginBottom: 8 }]}>☕ Break Style</Text>
+                {[
+                  { value: 'short_frequent', label: "Short & Sweet (5-10 min/hour)" },
+                  { value: 'medium', label: "Balanced (15-20 min/2 hours)" },
+                  { value: 'long_rare', label: "Long & Deep (30+ min)" },
+                  { value: 'no_schedule', label: "Go with the flow" },
+                ].map(option => (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={[
+                      styles.preferenceOption,
+                      preferences.break_preference === option.value && styles.preferenceOptionSelected
+                    ]}
+                    onPress={() => setPreferences({ ...preferences, break_preference: option.value })}
+                  >
+                    <Text style={[
+                      styles.preferenceOptionText,
+                      preferences.break_preference === option.value && styles.preferenceOptionTextSelected
+                    ]}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Work Style */}
+              <View style={styles.card}>
+                <Text style={[styles.profileLabel, { marginBottom: 8 }]}>⚡ Work Session Length</Text>
+                {[
+                  { value: 'sprint', label: "Quick Sprints (20-30 min)" },
+                  { value: 'standard', label: "Standard Blocks (45-60 min)" },
+                  { value: 'deep_dive', label: "Deep Dive (90+ min)" },
+                  { value: 'flexible', label: "Mix it up" },
+                ].map(option => (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={[
+                      styles.preferenceOption,
+                      preferences.work_style === option.value && styles.preferenceOptionSelected
+                    ]}
+                    onPress={() => setPreferences({ ...preferences, work_style: option.value })}
+                  >
+                    <Text style={[
+                      styles.preferenceOptionText,
+                      preferences.work_style === option.value && styles.preferenceOptionTextSelected
+                    ]}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Planning Style */}
+              <View style={styles.card}>
+                <Text style={[styles.profileLabel, { marginBottom: 8 }]}>📋 Planning Style</Text>
+                {[
+                  { value: 'detailed', label: "Every minute planned" },
+                  { value: 'rough_outline', label: "Rough outline" },
+                  { value: 'priorities', label: "Just priorities" },
+                  { value: 'spontaneous', label: "Wing it" },
+                ].map(option => (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={[
+                      styles.preferenceOption,
+                      preferences.planning_style === option.value && styles.preferenceOptionSelected
+                    ]}
+                    onPress={() => setPreferences({ ...preferences, planning_style: option.value })}
+                  >
+                    <Text style={[
+                      styles.preferenceOptionText,
+                      preferences.planning_style === option.value && styles.preferenceOptionTextSelected
+                    ]}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Save/Cancel Buttons */}
+              <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+                <TouchableOpacity
+                  style={[styles.button, styles.primaryButton, { flex: 1 }]}
+                  onPress={handleSavePreferences}
+                  disabled={savingPreferences}
+                >
+                  {savingPreferences ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.buttonText}>Save Changes</Text>
+                  )}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.button, { flex: 1, backgroundColor: '#6b7280' }]}
+                  onPress={() => {
+                    setEditingPreferences(false);
+                    fetchProfile(); // Reload original preferences
+                  }}
+                  disabled={savingPreferences}
+                >
+                  <Text style={styles.buttonText}>Cancel</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+        </View>
+      )}
+
       {/* Google Calendar */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Integrations</Text>
-        <View style={styles.card}>
+      <View style={styles.profileSection}>
+        <Text style={styles.profileSectionTitle}>Integrations</Text>
+        <View style={styles.profileCard}>
           <Text style={styles.profileLabel}>Google Calendar</Text>
           <Text style={styles.profileValue}>
             {profile?.has_google_calendar ? '✅ Connected' : '❌ Not connected'}
@@ -2843,32 +3695,66 @@ const MainTabs = () => (
       tabBarStyle: styles.tabBar,
       tabBarActiveTintColor: '#6366f1',
       tabBarInactiveTintColor: '#9ca3af',
+      tabBarShowLabel: true,
+      tabBarLabelStyle: {
+        fontSize: 11,
+        fontWeight: '600',
+        marginBottom: 4,
+      },
+      tabBarIconStyle: {
+        marginTop: 4,
+      },
     }}
   >
     <Tab.Screen
       name="Home"
       component={HomeScreen}
-      options={{ tabBarLabel: '🏠 Home' }}
+      options={{
+        tabBarLabel: 'Home',
+        tabBarIcon: ({ color, size }) => (
+          <Text style={{ fontSize: 24, color }}>🏠</Text>
+        ),
+      }}
     />
     <Tab.Screen
       name="Calendar"
       component={CalendarScreen}
-      options={{ tabBarLabel: '📅 Calendar' }}
+      options={{
+        tabBarLabel: 'Calendar',
+        tabBarIcon: ({ color, size }) => (
+          <Text style={{ fontSize: 24, color }}>📅</Text>
+        ),
+      }}
     />
     <Tab.Screen
       name="Tasks"
       component={TasksScreen}
-      options={{ tabBarLabel: '✓ Tasks' }}
+      options={{
+        tabBarLabel: 'Tasks',
+        tabBarIcon: ({ color, size }) => (
+          <Text style={{ fontSize: 24, color }}>✓</Text>
+        ),
+      }}
     />
     <Tab.Screen
       name="Chat"
       component={ChatScreen}
-      options={{ tabBarLabel: '💬 AI Chat' }}
+      options={{
+        tabBarLabel: 'Chat',
+        tabBarIcon: ({ color, size }) => (
+          <Text style={{ fontSize: 24, color }}>💬</Text>
+        ),
+      }}
     />
     <Tab.Screen
       name="Profile"
       component={ProfileScreen}
-      options={{ tabBarLabel: '👤 Profile' }}
+      options={{
+        tabBarLabel: 'Profile',
+        tabBarIcon: ({ color, size }) => (
+          <Text style={{ fontSize: 24, color }}>👤</Text>
+        ),
+      }}
     />
   </Tab.Navigator>
 );
@@ -2877,28 +3763,232 @@ const MainTabs = () => (
 // MAIN APP
 // ============================================================================
 
+// ============================================================================
+// ONBOARDING QUESTIONNAIRE COMPONENT
+// ============================================================================
+
+const OnboardingQuestionnaire: React.FC<{ onComplete: () => void }> = ({ onComplete }) => {
+  const [currentQuestion, setCurrentQuestion] = useState(0);
+  const [answers, setAnswers] = useState<any>({});
+  const [saving, setSaving] = useState(false);
+
+  const questions = [
+    {
+      id: 'work_rhythm',
+      question: "When do you feel most productive? 🌅🌙",
+      emoji: '⏰',
+      options: [
+        { value: 'early_bird', label: "Early Bird (5am-9am) - I'm up with the sun!" },
+        { value: 'morning_person', label: "Morning Person (9am-12pm) - Fresh and ready!" },
+        { value: 'afternoon_warrior', label: "Afternoon Warrior (12pm-5pm) - Post-lunch power!" },
+        { value: 'night_owl', label: "Night Owl (9pm-2am) - The night is young!" },
+      ]
+    },
+    {
+      id: 'break_preference',
+      question: "How do you like to take breaks? ☕",
+      emoji: '🎯',
+      options: [
+        { value: 'short_frequent', label: "Short & Sweet (5-10 min every hour) - Quick recharge!" },
+        { value: 'medium', label: "Balanced (15-20 min every 2 hours) - Classic approach" },
+        { value: 'long_rare', label: "Long & Deep (30+ min, less often) - Real downtime" },
+        { value: 'no_schedule', label: "Go with the flow - I break when I need to!" },
+      ]
+    },
+    {
+      id: 'work_style',
+      question: "What's your ideal work session like? 💪",
+      emoji: '⚡',
+      options: [
+        { value: 'sprint', label: "Quick Sprints (20-30 min bursts) - Fast & focused!" },
+        { value: 'standard', label: "Standard Blocks (45-60 min) - The sweet spot" },
+        { value: 'deep_dive', label: "Deep Dive (90+ min) - Flow state master!" },
+        { value: 'flexible', label: "Mix it up - Depends on the task!" },
+      ]
+    },
+    {
+      id: 'planning_style',
+      question: "How do you approach planning your day? 📅",
+      emoji: '📋',
+      options: [
+        { value: 'detailed', label: "Every minute planned - I love structure!" },
+        { value: 'rough_outline', label: "Rough outline - Know the big stuff" },
+        { value: 'priorities', label: "Just priorities - Top 3 things today" },
+        { value: 'spontaneous', label: "Wing it - I work better spontaneously!" },
+      ]
+    },
+  ];
+
+  const handleAnswer = (value: string) => {
+    const newAnswers = { ...answers, [questions[currentQuestion].id]: value };
+    setAnswers(newAnswers);
+
+    if (currentQuestion < questions.length - 1) {
+      setTimeout(() => setCurrentQuestion(currentQuestion + 1), 300);
+    } else {
+      // Save and complete
+      saveOnboarding(newAnswers);
+    }
+  };
+
+  const saveOnboarding = async (finalAnswers: any) => {
+    setSaving(true);
+    try {
+      await api.post('/ai/onboarding/', { 
+        responses: finalAnswers,
+        onboarding_completed: true 
+      });
+      setTimeout(() => {
+        onComplete();
+      }, 500);
+    } catch (error) {
+      console.error('[ONBOARDING] Error saving:', error);
+      Alert.alert('Error', 'Failed to save preferences. Please try again.');
+      setSaving(false);
+    }
+  };
+
+  const question = questions[currentQuestion];
+  const progress = ((currentQuestion + 1) / questions.length) * 100;
+
+  return (
+    <Modal visible={true} animationType="fade" transparent={true}>
+      <View style={styles.onboardingOverlay}>
+        <View style={styles.onboardingContainer}>
+          {/* Progress Bar */}
+          <View style={styles.progressBarContainer}>
+            <View style={[styles.progressBar, { width: `${progress}%` }]} />
+          </View>
+
+          {/* Question Number */}
+          <Text style={styles.questionNumber}>
+            Question {currentQuestion + 1} of {questions.length}
+          </Text>
+
+          {/* Emoji */}
+          <Text style={styles.questionEmoji}>{question.emoji}</Text>
+
+          {/* Question */}
+          <Text style={styles.questionText}>{question.question}</Text>
+
+          {/* Options */}
+          <View style={styles.optionsContainer}>
+            {question.options.map((option, index) => (
+              <TouchableOpacity
+                key={index}
+                style={[
+                  styles.optionButton,
+                  answers[question.id] === option.value && styles.optionButtonSelected
+                ]}
+                onPress={() => handleAnswer(option.value)}
+                disabled={saving}
+              >
+                <Text style={[
+                  styles.optionText,
+                  answers[question.id] === option.value && styles.optionTextSelected
+                ]}>
+                  {option.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {saving && (
+            <View style={{ marginTop: 20 }}>
+              <ActivityIndicator size="large" color="#6366f1" />
+              <Text style={{ textAlign: 'center', color: '#6b7280', marginTop: 8 }}>Saving your preferences...</Text>
+            </View>
+          )}
+
+          {/* Navigation */}
+          {currentQuestion > 0 && !saving && (
+            <TouchableOpacity
+              style={styles.backButton}
+              onPress={() => setCurrentQuestion(currentQuestion - 1)}
+            >
+              <Text style={styles.backButtonText}>← Back</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+};
+
+// ============================================================================
+// MAIN APP WITH ONBOARDING
+// ============================================================================
+
+// Main content component that properly uses hooks
+const MainContent: React.FC = () => {
+  const { isAuthenticated, loading, user } = useContext(AuthContext);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [checkingOnboarding, setCheckingOnboarding] = useState(true);
+
+  // Check onboarding status when authenticated
+  useEffect(() => {
+    const checkOnboardingStatus = async () => {
+      if (isAuthenticated && user) {
+        try {
+          const response = await api.get('/ai/memory/');
+          const aiMemory = response.data;
+          
+          // Keep showing onboarding until completed
+          if (!aiMemory.onboarding_completed) {
+            setShowOnboarding(true);
+          } else {
+            setShowOnboarding(false);
+          }
+        } catch (error) {
+          console.error('[APP] Error checking onboarding:', error);
+          setShowOnboarding(false);
+        }
+      } else {
+        setShowOnboarding(false);
+      }
+      setCheckingOnboarding(false);
+    };
+
+    if (isAuthenticated) {
+      checkOnboardingStatus();
+    } else {
+      setCheckingOnboarding(false);
+      setShowOnboarding(false);
+    }
+  }, [isAuthenticated, user]);
+
+  const handleOnboardingComplete = () => {
+    setShowOnboarding(false);
+  };
+
+  if (loading || (isAuthenticated && checkingOnboarding)) {
+    return (
+      <View style={styles.centerContainer}>
+        <ActivityIndicator size="large" color="#6366f1" />
+        <Text style={{ marginTop: 10 }}>Loading...</Text>
+      </View>
+    );
+  }
+
+  return (
+    <>
+      {isAuthenticated ? (
+        <MainTabs key="main-tabs" />
+      ) : (
+        <AuthStack key="auth-stack" />
+      )}
+      
+      {isAuthenticated && showOnboarding && (
+        <OnboardingQuestionnaire onComplete={handleOnboardingComplete} />
+      )}
+    </>
+  );
+};
+
 export default function App() {
   return (
     <AuthProvider>
-      <AuthContext.Consumer>
-        {({ isAuthenticated, loading }) => {
-          if (loading) {
-            return (
-              <View style={styles.centerContainer}>
-                <ActivityIndicator size="large" color="#6366f1" />
-                <Text style={{ marginTop: 10 }}>Loading...</Text>
-              </View>
-            );
-          }
-
-          // Use key to force remount when auth state changes
-          return isAuthenticated ? (
-            <MainTabs key="main-tabs" />
-          ) : (
-            <AuthStack key="auth-stack" />
-          );
-        }}
-      </AuthContext.Consumer>
+      <MainContent />
       <StatusBar style="auto" />
     </AuthProvider>
   );
@@ -2925,6 +4015,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     padding: 24,
     backgroundColor: '#fff',
+  },
+  authScrollContainer: {
+    flexGrow: 1,
+    justifyContent: 'center',
+  },
+  authContentWrapper: {
+    padding: 24,
+    alignItems: 'center',
   },
   appTitle: {
     fontSize: 40,
@@ -3143,12 +4241,24 @@ const styles = StyleSheet.create({
   taskStatusText: {
     fontSize: 26,
   },
+  checkboxButton: {
+    width: 44,
+    height: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#f9fafb',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  checkboxIcon: {
+    fontSize: 24,
+  },
   deleteButton: {
     width: 44,
     height: 44,
     justifyContent: 'center',
     alignItems: 'center',
-    marginLeft: 8,
   },
   deleteButtonText: {
     fontSize: 22,
@@ -3332,17 +4442,93 @@ const styles = StyleSheet.create({
   },
   chatContainer: {
     flex: 1,
-    backgroundColor: '#f9fafb',
+    backgroundColor: '#f3f4f6',
+  },
+  chatHeader: {
     paddingTop: 60,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    backgroundColor: '#6366f1',
+  },
+  chatHeaderTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 6,
+  },
+  chatHeaderSubtitle: {
+    fontSize: 15,
+    color: '#e0e7ff',
+    opacity: 0.95,
+  },
+  tasksHeader: {
+    paddingTop: 60,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    backgroundColor: '#6366f1',
+  },
+  tasksHeaderTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 6,
+  },
+  tasksHeaderSubtitle: {
+    fontSize: 15,
+    color: '#e0e7ff',
+    opacity: 0.95,
+  },
+  referenceBar: {
+    backgroundColor: '#eff6ff',
+    borderTopWidth: 1,
+    borderTopColor: '#bfdbfe',
+    borderBottomWidth: 1,
+    borderBottomColor: '#bfdbfe',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  referenceLabel: {
+    fontSize: 11,
+    color: '#6366f1',
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  referenceTaskName: {
+    fontSize: 15,
+    color: '#1e3a8a',
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  referenceCloseButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#dbeafe',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  referenceCloseText: {
+    fontSize: 16,
+    color: '#3b82f6',
+    fontWeight: '600',
   },
   messagesList: {
     padding: 20,
   },
   messageBubble: {
     maxWidth: '80%',
-    padding: 12,
-    borderRadius: 16,
-    marginBottom: 10,
+    padding: 14,
+    borderRadius: 18,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 3,
+    elevation: 2,
   },
   userBubble: {
     alignSelf: 'flex-end',
@@ -3351,8 +4537,6 @@ const styles = StyleSheet.create({
   aiBubble: {
     alignSelf: 'flex-start',
     backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
   },
   messageText: {
     fontSize: 15,
@@ -3365,10 +4549,15 @@ const styles = StyleSheet.create({
   },
   chatInputContainer: {
     flexDirection: 'row',
-    padding: 10,
+    padding: 12,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#e5e7eb',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 5,
   },
   chatInput: {
     flex: 1,
@@ -3404,6 +4593,395 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: 'bold',
   },
+  onboardingOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  onboardingContainer: {
+    backgroundColor: '#fff',
+    borderRadius: 24,
+    padding: 32,
+    width: '100%',
+    maxWidth: 500,
+    maxHeight: '90%',
+  },
+  // Home Page Styles
+  homeSection: {
+    backgroundColor: '#fff',
+    marginHorizontal: 16,
+    marginTop: 20,
+    padding: 20,
+    borderRadius: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  progressHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  progressIcon: {
+    fontSize: 24,
+    marginRight: 8,
+  },
+  progressTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#111827',
+  },
+  progressLabel: {
+    fontSize: 14,
+    color: '#6b7280',
+    marginBottom: 8,
+  },
+  progressCount: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#111827',
+    marginBottom: 16,
+  },
+  progressBarContainer: {
+    height: 12,
+    backgroundColor: '#e5e7eb',
+    borderRadius: 6,
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: '#6366f1',
+    borderRadius: 6,
+  },
+  progressMessage: {
+    fontSize: 14,
+    color: '#6b7280',
+    lineHeight: 20,
+  },
+  statsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    marginTop: 20,
+    gap: 12,
+  },
+  statCard: {
+    flex: 1,
+    backgroundColor: '#fff',
+    padding: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  statIconContainer: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#e0e7ff',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  statIcon: {
+    fontSize: 20,
+  },
+  statLabel: {
+    fontSize: 12,
+    color: '#6b7280',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  statValue: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#111827',
+  },
+  focusHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  focusIcon: {
+    fontSize: 20,
+    marginBottom: 4,
+  },
+  focusTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#111827',
+  },
+  viewAllButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    backgroundColor: '#f3f4f6',
+  },
+  viewAllText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#6366f1',
+  },
+  emptyFocusCard: {
+    padding: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyFocusText: {
+    fontSize: 15,
+    color: '#6b7280',
+    textAlign: 'center',
+  },
+  focusCard: {
+    backgroundColor: '#fafafa',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 12,
+    borderLeftWidth: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  focusCardContent: {
+    flex: 1,
+    marginRight: 12,
+  },
+  focusTaskTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#111827',
+    marginBottom: 8,
+  },
+  focusTaskMeta: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  focusTaskTime: {
+    fontSize: 13,
+    color: '#6b7280',
+  },
+  focusTaskDuration: {
+    fontSize: 13,
+    color: '#6b7280',
+  },
+  focusTaskLocation: {
+    fontSize: 13,
+    color: '#6b7280',
+    flex: 1,
+  },
+  priorityBadge: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+  },
+  priorityBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#374151',
+  },
+  helpSection: {
+    backgroundColor: '#6366f1',
+    marginHorizontal: 16,
+    marginTop: 20,
+    marginBottom: 100,
+    padding: 24,
+    borderRadius: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  helpTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 8,
+  },
+  helpSubtitle: {
+    fontSize: 14,
+    color: '#fff',
+    opacity: 0.9,
+    marginBottom: 20,
+    lineHeight: 20,
+  },
+  chatButton: {
+    backgroundColor: '#fff',
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    borderRadius: 10,
+    alignSelf: 'flex-end',
+  },
+  chatButtonText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#6366f1',
+  },
+  welcomeHeader: {
+    paddingTop: 60,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    backgroundColor: '#6366f1',
+  },
+  welcomeTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 6,
+  },
+  welcomeSubtitle: {
+    fontSize: 15,
+    color: '#e0e7ff',
+    opacity: 0.95,
+  },
+  profileHeader: {
+    paddingTop: 60,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    backgroundColor: '#6366f1',
+  },
+  profileHeaderTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 6,
+  },
+  profileHeaderSubtitle: {
+    fontSize: 15,
+    color: '#e0e7ff',
+    opacity: 0.95,
+  },
+  profileSection: {
+    marginHorizontal: 16,
+    marginTop: 20,
+  },
+  profileSectionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 12,
+  },
+  profileCard: {
+    backgroundColor: '#fff',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  logoutButton: {
+    backgroundColor: '#ef4444',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  logoutButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  progressBar: {
+    height: '100%',
+    backgroundColor: '#6366f1',
+    borderRadius: 3,
+  },
+  questionNumber: {
+    fontSize: 13,
+    color: '#6b7280',
+    textAlign: 'center',
+    marginBottom: 16,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  questionEmoji: {
+    fontSize: 48,
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  questionText: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: '#111827',
+    textAlign: 'center',
+    marginBottom: 32,
+    lineHeight: 30,
+  },
+  optionsContainer: {
+    gap: 12,
+  },
+  optionButton: {
+    backgroundColor: '#f9fafb',
+    borderWidth: 2,
+    borderColor: '#e5e7eb',
+    borderRadius: 12,
+    padding: 16,
+  },
+  optionButtonSelected: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#6366f1',
+  },
+  optionText: {
+    fontSize: 15,
+    color: '#374151',
+    fontWeight: '500',
+    textAlign: 'center',
+  },
+  optionTextSelected: {
+    color: '#6366f1',
+    fontWeight: '600',
+  },
+  backButton: {
+    marginTop: 24,
+    alignSelf: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+  },
+  backButtonText: {
+    color: '#6b7280',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  preferenceOption: {
+    backgroundColor: '#f9fafb',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 8,
+  },
+  preferenceOptionSelected: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#6366f1',
+    borderWidth: 2,
+  },
+  preferenceOptionText: {
+    fontSize: 14,
+    color: '#374151',
+  },
+  preferenceOptionTextSelected: {
+    color: '#6366f1',
+    fontWeight: '600',
+  },
   profileLabel: {
     fontSize: 12,
     color: '#6b7280',
@@ -3415,10 +4993,372 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#111827',
   },
-  tabBar: {
+  profileImageContainer: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#e0e7ff',
+    justifyContent: 'center',
+    alignItems: 'center',
+    position: 'relative',
+  },
+  profileImagePlaceholder: {
+    fontSize: 40,
+  },
+  profileImageBadge: {
+    position: 'absolute',
+    bottom: 0,
+    right: 0,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#6366f1',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#fff',
+  },
+  profileImageBadgeText: {
+    fontSize: 12,
+  },
+  profileDisplayName: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 4,
+  },
+  profileDisplayEmail: {
+    fontSize: 14,
+    color: '#6b7280',
+  },
+  profileEditInput: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
+    color: '#111827',
+    backgroundColor: '#fff',
+    marginTop: 8,
+  },
+  profileSaveButton: {
+    flex: 1,
+    backgroundColor: '#6366f1',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  profileCancelButton: {
+    flex: 1,
+    backgroundColor: '#f3f4f6',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  calendarHeader: {
+    backgroundColor: '#6366f1',
+    paddingTop: 60,
+  },
+  calendarHeaderTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 6,
+  },
+  calendarHeaderSubtitle: {
+    fontSize: 15,
+    color: '#e0e7ff',
+    opacity: 0.95,
+  },
+  viewSelector: {
+    flexDirection: 'row',
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    gap: 8,
+  },
+  viewButton: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    alignItems: 'center',
+  },
+  viewButtonActive: {
+    backgroundColor: '#fff',
+  },
+  viewButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#e0e7ff',
+  },
+  viewButtonTextActive: {
+    color: '#6366f1',
+  },
+  // Monthly Calendar View Styles
+  monthWeekdayHeader: {
+    flexDirection: 'row',
+    backgroundColor: '#f9fafb',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+    paddingVertical: 8,
+  },
+  monthWeekdayCell: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  monthWeekdayText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  monthGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  monthDayCell: {
+    width: '14.28%', // 100% / 7 days
+    aspectRatio: 1,
+    borderBottomWidth: 1,
+    borderRightWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 4,
+  },
+  monthDayNumber: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+  },
+  monthDayNumberToday: {
+    backgroundColor: '#6366f1',
+  },
+  monthDayText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#111827',
+  },
+  monthDayTextOther: {
+    color: '#9ca3af',
+  },
+  monthDayTextToday: {
+    color: '#fff',
+    fontWeight: '700',
+  },
+  monthEventDots: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 2,
+    marginTop: 4,
+  },
+  monthEventDot: {
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+  },
+  monthEventMore: {
+    fontSize: 9,
+    color: '#6b7280',
+    fontWeight: '600',
+  },
+  // Timeline View Styles (Day/3-Day/Week)
+  timeColumn: {
+    width: 50,
+    backgroundColor: '#f9fafb',
+    borderRightWidth: 1,
+    borderRightColor: '#e5e7eb',
+  },
+  timeSlot: {
     height: 60,
-    paddingBottom: 5,
+    justifyContent: 'flex-start',
+    paddingTop: 2,
+    paddingRight: 4,
+    alignItems: 'flex-end',
+  },
+  timeLabel: {
+    fontSize: 9,
+    color: '#6b7280',
+    fontWeight: '500',
+  },
+  dayHeadersRow: {
+    flexDirection: 'row',
+    backgroundColor: '#fff',
+    borderBottomWidth: 2,
+    borderBottomColor: '#e5e7eb',
+    paddingVertical: 8,
+  },
+  dayHeader: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  dayHeaderWeekday: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#6b7280',
+    textTransform: 'uppercase',
+  },
+  dayHeaderWeekdayToday: {
+    color: '#6366f1',
+  },
+  dayHeaderNumber: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 4,
+  },
+  dayHeaderNumberToday: {
+    backgroundColor: '#6366f1',
+  },
+  dayHeaderNumberText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  dayHeaderNumberTextToday: {
+    color: '#fff',
+  },
+  dayColumn: {
+    flex: 1,
+    borderRightWidth: 1,
+    borderRightColor: '#e5e7eb',
+    position: 'relative',
+  },
+  hourRow: {
+    height: 60,
+  },
+  hourLine: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: '#e5e7eb',
+  },
+  eventsContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  timelineEvent: {
+    position: 'absolute',
+    left: 2,
+    right: 2,
+    borderRadius: 4,
+    padding: 4,
+    overflow: 'hidden',
+  },
+  timelineEventTitle: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  timelineEventTime: {
+    fontSize: 9,
+    color: '#e0e7ff',
+    marginTop: 1,
+  },
+  timelineEventLocation: {
+    fontSize: 9,
+    color: '#e0e7ff',
+    marginTop: 1,
+  },
+  dateNavigation: {
+    backgroundColor: '#fff',
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  dateNavRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  dateNavButton: {
+    padding: 10,
+    backgroundColor: '#f3f4f6',
+    borderRadius: 10,
+    minWidth: 44,
+    alignItems: 'center',
+  },
+  dateNavArrow: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#374151',
+  },
+  dateNavCenter: {
+    alignItems: 'center',
+    flex: 1,
+  },
+  dateNavDate: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  dateNavDay: {
+    fontSize: 13,
+    color: '#6b7280',
+    marginTop: 2,
+  },
+  todayButton: {
+    marginTop: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    backgroundColor: '#6366f1',
+    borderRadius: 8,
+    alignSelf: 'center',
+  },
+  todayButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  taskTabs: {
+    flexDirection: 'row',
+    backgroundColor: '#fff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  taskTab: {
+    flex: 1,
+    paddingVertical: 14,
+    borderBottomWidth: 3,
+    borderBottomColor: 'transparent',
+  },
+  taskTabActive: {
+    borderBottomColor: '#6366f1',
+  },
+  taskTabText: {
+    textAlign: 'center',
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#9ca3af',
+  },
+  taskTabTextActive: {
+    color: '#6366f1',
+  },
+  tabBar: {
+    backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#e5e7eb',
+    height: 85,
+    paddingBottom: 20,
+    paddingTop: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 10,
   },
 });

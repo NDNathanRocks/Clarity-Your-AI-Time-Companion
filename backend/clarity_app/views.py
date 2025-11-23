@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.contrib.auth import authenticate
 from django.utils import timezone
+from django.db import models
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -123,16 +124,10 @@ def profile_view(request):
     print(f"[PROFILE] Metrics: {bool(ai_memory.performance_metrics)}")
     
     if user_has_data:
-        # Check if we need to regenerate (if never generated, default message, or older than 24 hours)
-        from datetime import timedelta
-        should_regenerate = (
-            not ai_memory.ai_summary or 
-            ai_memory.ai_summary.startswith('Welcome to Clarity!') or
-            not ai_memory.ai_summary_updated or
-            timezone.now() - ai_memory.ai_summary_updated > timedelta(hours=24)
-        )
+        # Always regenerate on login for fresh, motivational message
+        should_regenerate = True
         
-        print(f"[PROFILE] Should regenerate: {should_regenerate}")
+        print(f"[PROFILE] Regenerating AI summary on login")
         print(f"[PROFILE] Current summary: {ai_memory.ai_summary[:50] if ai_memory.ai_summary else 'None'}")
         
         if should_regenerate:
@@ -161,6 +156,42 @@ def profile_view(request):
     response_data['ai_memory'] = AIMemorySerializer(ai_memory).data
     
     return Response(response_data)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def profile_update(request):
+    """Update user profile (username, first_name, last_name)"""
+    user = request.user
+    
+    username = request.data.get('username')
+    first_name = request.data.get('first_name', '')
+    last_name = request.data.get('last_name', '')
+    
+    try:
+        # Check if username is being changed and if it's already taken
+        if username and username != user.username:
+            if User.objects.filter(username=username).exists():
+                return Response({
+                    'error': 'This username is already taken. Please choose another.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            user.username = username
+        
+        # Update name fields
+        user.first_name = first_name
+        user.last_name = last_name
+        user.save()
+        
+        # Return updated user data
+        return Response({
+            'user': UserSerializer(user).data,
+            'message': 'Profile updated successfully!'
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        return Response({
+            'error': f'Failed to update profile: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ============================================================================
@@ -274,6 +305,20 @@ def google_calendar_events(request):
         print(f"[CALENDAR] Event: {evt.id} - {evt.title} at {evt.start_time}")
     
     for event in app_events:
+        # Check if this event is linked to a task to get priority and status
+        task_priority = None
+        task_status = None
+        task_id = None
+        event_id_str = f'app-{event.id}'
+        try:
+            linked_task = Task.objects.filter(user=request.user, calendar_event_id=event_id_str).first()
+            if linked_task:
+                task_priority = linked_task.priority
+                task_status = linked_task.status
+                task_id = linked_task.id
+        except:
+            pass
+        
         all_events.append({
             'id': f'app-{event.id}',
             'title': event.title,
@@ -284,6 +329,9 @@ def google_calendar_events(request):
             'source': 'app',
             'color': event.color,
             'all_day': event.all_day,
+            'priority': task_priority,  # Will be None for non-task events
+            'status': task_status,  # Will be None for non-task events
+            'task_id': task_id,  # Will be None for non-task events
         })
     
     # Try to get Google Calendar events if connected
@@ -520,6 +568,26 @@ def task_breakdown_analyze(request):
         if task_categories:
             category_context = f"Known task patterns: {json.dumps(task_categories, indent=2)}"
         
+        # Get user preferences from onboarding
+        preferences_hint = ""
+        if ai_memory.onboarding_data:
+            prefs = ai_memory.onboarding_data
+            hints = []
+            if prefs.get('work_style') in ['sprint', 'short_frequent']:
+                hints.append("User prefers shorter focused sessions (20-30 min)")
+            elif prefs.get('work_style') in ['marathon', 'deep_dive']:
+                hints.append("User prefers longer deep work sessions (90+ min)")
+            else:
+                hints.append("User prefers balanced work sessions (45-60 min)")
+            
+            if prefs.get('break_preference') == 'short_frequent':
+                hints.append("Include breaks every hour")
+            elif prefs.get('break_preference') == 'long_rare':
+                hints.append("Can work longer without breaks")
+            
+            if hints:
+                preferences_hint = f"User preferences: {'; '.join(hints)}"
+        
         # Call Claude for task analysis
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         
@@ -529,8 +597,10 @@ Task: "{task_title}"
 {f'Details: {task_description[:100]}' if task_description else ''}
 
 User patterns: {performance_context[:100] if performance_context else 'Learning...'}
+{preferences_hint}
 
 Break down if: >90min, multi-step, or complex.
+IMPORTANT: Size subtasks according to user's work style preferences above.
 
 Respond with ONLY valid JSON. Keep all text BRIEF (under 40 chars):
 {{
@@ -596,6 +666,7 @@ If no breakdown needed, return empty suggested_subtasks array."""
 def task_create_with_subtasks(request):
     """
     Create a task with optional subtasks (from accepted Clarity Breakdown)
+    Can also create a single subtask if parent_task is specified
     """
     task_title = request.data.get('title', '')
     task_description = request.data.get('description', '')
@@ -606,12 +677,35 @@ def task_create_with_subtasks(request):
     location = request.data.get('location')
     scheduled_date = request.data.get('scheduled_date')
     scheduled_time = request.data.get('scheduled_time')
+    parent_task_id = request.data.get('parent_task')  # For creating subtasks
+    order = request.data.get('order', 0)
     
     if not task_title:
         return Response({'error': 'Task title is required'}, status=status.HTTP_400_BAD_REQUEST)
     
     try:
-        # Create parent task
+        # If parent_task is specified, create as a subtask
+        if parent_task_id:
+            try:
+                parent = Task.objects.get(id=parent_task_id, user=request.user)
+                subtask = Task.objects.create(
+                    user=request.user,
+                    parent_task=parent,
+                    title=task_title,
+                    description=task_description,
+                    estimated_duration_minutes=estimated_minutes,
+                    ai_friendly_message=ai_message,
+                    status='pending',
+                    order=order,
+                )
+                return Response({
+                    'task': TaskSerializer(subtask).data,
+                    'message': 'Subtask created successfully!'
+                }, status=status.HTTP_201_CREATED)
+            except Task.DoesNotExist:
+                return Response({'error': 'Parent task not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Otherwise, create parent task with optional subtasks
         parent_task = Task.objects.create(
             user=request.user,
             title=task_title,
@@ -627,7 +721,7 @@ def task_create_with_subtasks(request):
         
         # Create subtasks if provided
         subtasks = []
-        for subtask_data in subtasks_data:
+        for idx, subtask_data in enumerate(subtasks_data):
             subtask = Task.objects.create(
                 user=request.user,
                 parent_task=parent_task,
@@ -635,7 +729,8 @@ def task_create_with_subtasks(request):
                 description=subtask_data.get('description', ''),
                 estimated_duration_minutes=subtask_data.get('estimated_duration_minutes', 30),
                 ai_friendly_message=subtask_data.get('ai_message', ''),
-                status='pending'
+                status='pending',
+                order=idx,  # Set order based on position in array
             )
             subtasks.append(subtask)
         
@@ -808,7 +903,11 @@ def task_schedule(request):
         
         # Parse date and time
         scheduled_date = datetime.strptime(scheduled_date_str, '%Y-%m-%d').date()
-        scheduled_time = datetime.strptime(scheduled_time_str, '%H:%M').time()
+        # Handle both HH:MM and HH:MM:SS formats
+        try:
+            scheduled_time = datetime.strptime(scheduled_time_str, '%H:%M:%S').time()
+        except ValueError:
+            scheduled_time = datetime.strptime(scheduled_time_str, '%H:%M').time()
         
         # Create start and end datetime (naive - in user's local timezone)
         # Django will store these as-is without UTC conversion
@@ -912,7 +1011,11 @@ def task_reschedule(request):
         
         # Parse new date and time
         new_date = datetime.strptime(new_date_str, '%Y-%m-%d').date()
-        new_time = datetime.strptime(new_time_str, '%H:%M').time()
+        # Handle both HH:MM and HH:MM:SS formats
+        try:
+            new_time = datetime.strptime(new_time_str, '%H:%M:%S').time()
+        except ValueError:
+            new_time = datetime.strptime(new_time_str, '%H:%M').time()
         
         # Create new start and end datetime (naive - in user's local timezone)
         naive_start = datetime.combine(new_date, new_time)
@@ -1303,25 +1406,103 @@ def ai_chat(request):
         if ai_memory.task_categories:
             memory_context += f"\n\nYour task patterns:\n{json.dumps(ai_memory.task_categories, indent=2)}"
         
-        # Get current date for relative date parsing
-        from datetime import date, time as dt_time
-        today = date.today()
+        # Include user preferences from onboarding
+        preferences_context = ""
+        if ai_memory.onboarding_data:
+            prefs = ai_memory.onboarding_data
+            pref_lines = []
+            
+            if 'work_rhythm' in prefs:
+                rhythm_map = {
+                    'early_bird': 'Early Bird (most productive 5am-9am)',
+                    'morning_person': 'Morning Person (most productive 9am-12pm)',
+                    'afternoon_warrior': 'Afternoon Warrior (most productive 12pm-5pm)',
+                    'night_owl': 'Night Owl (most productive 9pm-2am)'
+                }
+                pref_lines.append(f"Work Rhythm: {rhythm_map.get(prefs['work_rhythm'], prefs['work_rhythm'])}")
+            
+            if 'break_preference' in prefs:
+                break_map = {
+                    'short_frequent': 'Prefers short breaks (5-10 min every hour)',
+                    'medium': 'Prefers balanced breaks (15-20 min every 2 hours)',
+                    'long_rare': 'Prefers long breaks (30+ min, less often)',
+                    'no_schedule': 'Prefers flexible breaks (no fixed schedule)'
+                }
+                pref_lines.append(f"Break Style: {break_map.get(prefs['break_preference'], prefs['break_preference'])}")
+            
+            if 'work_style' in prefs:
+                work_map = {
+                    'sprint': 'Quick Sprints (20-30 min focused bursts)',
+                    'standard': 'Standard Blocks (45-60 min sessions)',
+                    'deep_dive': 'Deep Dive (90+ min flow state sessions)',
+                    'flexible': 'Flexible approach (adapts to task)',
+                    'marathon': 'Marathon Sessions (2-3 hours deep work)',
+                    'balanced': 'Balanced Blocks (45-90 min sustainable pace)'
+                }
+                pref_lines.append(f"Work Style: {work_map.get(prefs['work_style'], prefs['work_style'])}")
+            
+            if 'planning_style' in prefs:
+                plan_map = {
+                    'detailed': 'Detailed Planning (every minute planned)',
+                    'rough_outline': 'Rough Outline (knows the big stuff)',
+                    'priorities': 'Priority-Based (top 3 things)',
+                    'spontaneous': 'Spontaneous (wings it)',
+                    'structured': 'Structured Blocks (morning/afternoon/evening)',
+                    'loose': 'Loose Framework (just essentials)'
+                }
+                pref_lines.append(f"Planning Style: {plan_map.get(prefs['planning_style'], prefs['planning_style'])}")
+            
+            if pref_lines:
+                preferences_context = f"\n\nUser Preferences:\n" + "\n".join([f"- {line}" for line in pref_lines])
+        
+        # Get current date and time for relative date parsing
+        from datetime import date, time as dt_time, datetime
+        now = datetime.now()
+        today = now.date()
         today_str = today.strftime('%Y-%m-%d')
+        current_time = now.strftime('%I:%M %p')  # e.g., "02:30 PM"
+        current_time_24h = now.strftime('%H:%M')  # e.g., "14:30"
+        
+        # Get last discussed task for context continuity
+        last_task_context = ""
+        if ai_memory.work_patterns and 'last_task_id' in ai_memory.work_patterns:
+            try:
+                last_task_id = ai_memory.work_patterns['last_task_id']
+                last_task = Task.objects.get(id=last_task_id, user=request.user)
+                last_task_context = f"\n\nLast discussed task: ID:{last_task.id} - '{last_task.title}' ({last_task.status})"
+            except Task.DoesNotExist:
+                pass
         
         system_prompt = f"""You are Clarity, a friendly time-awareness assistant for users with time blindness.
 
 Today's date: {today_str}
+Current time: {current_time} ({current_time_24h})
 
 Recent tasks: {task_context[:200] if task_context else "None yet"}
 {performance_summary[:100] if performance_summary else ""}
 {memory_context[:300] if memory_context else ""}
+{preferences_context}
+{last_task_context}
 
 You can create AND update tasks. Be supportive, concise, and ACTION-ORIENTED.
+
+IMPORTANT: Use the user's preferences above when:
+- Scheduling tasks (consider their productive hours from Work Rhythm)
+- Estimating task duration (use their Work Style - sprints vs marathons)
+- Breaking down tasks (align with their Break Style and Work Style)
+- Suggesting times (match their Planning Style - detailed vs spontaneous)
+
+IMPORTANT - Time Awareness:
+- Use current time to check if tasks are overdue or coming up soon
+- Can ask "did you finish [task]?" to help users mark tasks complete
+- When discussing a specific task, remember its ID for follow-up questions
+- If user confirms completion, use update_task with mark_complete=true
 
 When creating tasks:
 - Parse dates: "today", "tomorrow", "next Monday", specific dates
 - Parse times: "2pm", "14:00", "afternoon"="14:00", "evening"="18:00", "morning"="09:00"
-- Estimate duration: meetings 30-60min, study 60-120min, errands 15-30min
+- Estimate duration based on user's work_style preference
+- If user asks about preferences, tell them what you know from the User Preferences section
 
 When user wants to UPDATE (move, change, reschedule):
 - Keywords: "move it", "change it", "make it", "nevermind", "actually", "reschedule"
@@ -1412,6 +1593,24 @@ Be proactive - when user says "make it evening" or "change to tomorrow", search 
                 }
             },
             {
+                "name": "list_tasks",
+                "description": "List tasks for a specific date or by status. Use this when user asks 'what tasks do I have today/tomorrow' or 'show me my tasks'. Returns all matching tasks with IDs.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "Date in YYYY-MM-DD format to filter tasks (optional). Use today's date if user asks 'today', tomorrow's date for 'tomorrow', etc."
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by status: 'pending', 'in_progress', 'done' (optional). Default to 'pending' if asking about upcoming/scheduled tasks."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "search_tasks",
                 "description": "Search for tasks by keywords. Always use this FIRST when user wants to update/change a task. Returns task IDs needed for updates.",
                 "input_schema": {
@@ -1447,6 +1646,14 @@ Be proactive - when user says "make it evening" or "change to tomorrow", search 
                             "type": "integer",
                             "description": "New duration in minutes if changing"
                         },
+                        "new_priority": {
+                            "type": "string",
+                            "description": "New priority level: 'low', 'medium', or 'high' if changing priority"
+                        },
+                        "new_location": {
+                            "type": "string",
+                            "description": "New location for the task if changing location"
+                        },
                         "mark_complete": {
                             "type": "boolean",
                             "description": "Set to true to mark task as complete"
@@ -1473,9 +1680,10 @@ Be proactive - when user says "make it evening" or "change to tomorrow", search 
         
         # Check if AI wants to use tools
         created_tasks = []
+        tool_results = []  # Initialize here so it's always defined
+        
         if message.stop_reason == "tool_use":
             # Process tool calls
-            tool_results = []
             
             for content_block in message.content:
                 if hasattr(content_block, 'type') and content_block.type == "tool_use":
@@ -1695,6 +1903,65 @@ If no breakdown needed, return empty suggested_subtasks array."""
                                 "content": f"Error creating breakdown task: {str(e)}"
                             })
                     
+                    elif tool_name == "list_tasks":
+                        try:
+                            filter_date = tool_input.get('date')
+                            filter_status = tool_input.get('status', 'pending')
+                            
+                            # Build query
+                            query = Task.objects.filter(user=request.user)
+                            
+                            if filter_date:
+                                query = query.filter(scheduled_date=filter_date)
+                            
+                            if filter_status:
+                                query = query.filter(status=filter_status)
+                            
+                            tasks = query.order_by('scheduled_time', 'created_at')[:20]
+                            
+                            if not tasks.exists():
+                                date_str = f" for {filter_date}" if filter_date else ""
+                                status_str = f" with status '{filter_status}'" if filter_status else ""
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": content_block.id,
+                                    "content": f"No tasks found{date_str}{status_str}."
+                                })
+                            else:
+                                results = []
+                                for task in tasks:
+                                    task_info = f"ID:{task.id} - '{task.title}'"
+                                    if task.scheduled_date and task.scheduled_time:
+                                        task_info += f" at {task.scheduled_time}"
+                                    elif task.scheduled_date:
+                                        task_info += f" (no specific time)"
+                                    else:
+                                        task_info += " (not scheduled)"
+                                    
+                                    if task.priority:
+                                        task_info += f" [{task.priority} priority]"
+                                    if task.location:
+                                        task_info += f" @ {task.location}"
+                                    
+                                    task_info += f" - {task.estimated_duration_minutes}min"
+                                    results.append(task_info)
+                                
+                                date_str = f" for {filter_date}" if filter_date else ""
+                                status_str = f" ({filter_status})" if filter_status else ""
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": content_block.id,
+                                    "content": f"Found {len(results)} task(s){date_str}{status_str}:\n" + "\n".join(results)
+                                })
+                            
+                        except Exception as e:
+                            print(f"[AI CHAT] Error listing tasks: {e}")
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": content_block.id,
+                                "content": f"Error listing tasks: {str(e)}"
+                            })
+                    
                     elif tool_name == "search_tasks":
                         try:
                             search_term = tool_input.get('search_term', '').lower()
@@ -1767,6 +2034,21 @@ If no breakdown needed, return empty suggested_subtasks array."""
                             if tool_input.get('mark_complete'):
                                 task.status = 'done'
                                 changes.append("marked as complete")
+                            
+                            # Handle priority change
+                            if tool_input.get('new_priority'):
+                                old_priority = task.priority or 'medium'
+                                task.priority = tool_input['new_priority']
+                                changes.append(f"priority changed from {old_priority} to {tool_input['new_priority']}")
+                            
+                            # Handle location change
+                            if tool_input.get('new_location') is not None:
+                                old_location = task.location or 'none'
+                                task.location = tool_input['new_location']
+                                if tool_input['new_location']:
+                                    changes.append(f"location changed to '{tool_input['new_location']}'")
+                                else:
+                                    changes.append("location removed")
                             
                             # Handle duration change
                             if tool_input.get('new_duration'):
@@ -1904,8 +2186,67 @@ If no breakdown needed, return empty suggested_subtasks array."""
                                 tool_name = content_block.name
                                 tool_input = content_block.input
                                 
+                                # Handle list_tasks
+                                if tool_name == "list_tasks":
+                                    try:
+                                        filter_date = tool_input.get('date')
+                                        filter_status = tool_input.get('status', 'pending')
+                                        
+                                        query = Task.objects.filter(user=request.user)
+                                        
+                                        if filter_date:
+                                            query = query.filter(scheduled_date=filter_date)
+                                        
+                                        if filter_status:
+                                            query = query.filter(status=filter_status)
+                                        
+                                        tasks = query.order_by('scheduled_time', 'created_at')[:20]
+                                        
+                                        if not tasks.exists():
+                                            date_str = f" for {filter_date}" if filter_date else ""
+                                            status_str = f" with status '{filter_status}'" if filter_status else ""
+                                            follow_up_tool_results.append({
+                                                "type": "tool_result",
+                                                "tool_use_id": content_block.id,
+                                                "content": f"No tasks found{date_str}{status_str}."
+                                            })
+                                        else:
+                                            results = []
+                                            for task in tasks:
+                                                task_info = f"ID:{task.id} - '{task.title}'"
+                                                if task.scheduled_date and task.scheduled_time:
+                                                    task_info += f" at {task.scheduled_time}"
+                                                elif task.scheduled_date:
+                                                    task_info += f" (no specific time)"
+                                                else:
+                                                    task_info += " (not scheduled)"
+                                                
+                                                if task.priority:
+                                                    task_info += f" [{task.priority} priority]"
+                                                if task.location:
+                                                    task_info += f" @ {task.location}"
+                                                
+                                                task_info += f" - {task.estimated_duration_minutes}min"
+                                                results.append(task_info)
+                                            
+                                            date_str = f" for {filter_date}" if filter_date else ""
+                                            status_str = f" ({filter_status})" if filter_status else ""
+                                            follow_up_tool_results.append({
+                                                "type": "tool_result",
+                                                "tool_use_id": content_block.id,
+                                                "content": f"Found {len(results)} task(s){date_str}{status_str}:\n" + "\n".join(results)
+                                            })
+                                        
+                                    except Exception as e:
+                                        print(f"[AI CHAT] Error listing tasks: {e}")
+                                        follow_up_tool_results.append({
+                                            "type": "tool_result",
+                                            "tool_use_id": content_block.id,
+                                            "content": f"Error listing tasks: {str(e)}"
+                                        })
+                                
                                 # Handle search_tasks
-                                if tool_name == "search_tasks":
+                                elif tool_name == "search_tasks":
                                     try:
                                         search_term = tool_input.get('search_term', '').lower()
                                         matching_tasks = Task.objects.filter(
@@ -1963,6 +2304,21 @@ If no breakdown needed, return empty suggested_subtasks array."""
                                                 "content": f"Task '{task_title}' deleted."
                                             })
                                             continue
+                                        
+                                        # Handle priority change
+                                        if tool_input.get('new_priority'):
+                                            old_priority = task.priority or 'medium'
+                                            task.priority = tool_input['new_priority']
+                                            changes.append(f"priority changed from {old_priority} to {tool_input['new_priority']}")
+                                        
+                                        # Handle location change
+                                        if tool_input.get('new_location') is not None:
+                                            old_location = task.location or 'none'
+                                            task.location = tool_input['new_location']
+                                            if tool_input['new_location']:
+                                                changes.append(f"location changed to '{tool_input['new_location']}'")
+                                            else:
+                                                changes.append("location removed")
                                         
                                         # Handle reschedule
                                         if tool_input.get('new_date') or tool_input.get('new_time'):
@@ -2072,11 +2428,28 @@ If no breakdown needed, return empty suggested_subtasks array."""
         
         response_text = response_text.strip() or "I've created that task for you!"
         
+        # Track last discussed task for context continuity
+        last_task_mentioned = None
+        for tool_result_block in tool_results if tool_results else []:
+            if hasattr(tool_result_block, 'get') and 'content' in tool_result_block:
+                content = tool_result_block['content']
+                # Extract task ID from search/update/create results
+                import re
+                task_id_match = re.search(r'ID:(\d+)', content)
+                if task_id_match:
+                    last_task_mentioned = task_id_match.group(1)
+        
         # Update AI memory context (append to summary, will be compressed periodically)
         if ai_memory.context_summary:
             ai_memory.context_summary += f"\n[User]: {user_message[:100]}... [AI]: {response_text[:100]}..."
         else:
             ai_memory.context_summary = f"[User]: {user_message[:100]}... [AI]: {response_text[:100]}..."
+        
+        # Store last discussed task for continuity
+        if last_task_mentioned:
+            if not ai_memory.work_patterns:
+                ai_memory.work_patterns = {}
+            ai_memory.work_patterns['last_task_id'] = last_task_mentioned
         
         # Compress context if getting too long (>5000 chars)
         if len(ai_memory.context_summary) > 5000:
@@ -2147,12 +2520,13 @@ def ai_onboarding(request):
     Called during first chat interaction or explicitly.
     """
     responses = request.data.get('responses', {})
+    onboarding_completed = request.data.get('onboarding_completed', True)
     
     ai_memory, _ = AIMemory.objects.get_or_create(user=request.user)
     
     # Store onboarding data
     ai_memory.onboarding_data = responses
-    ai_memory.onboarding_completed = True
+    ai_memory.onboarding_completed = onboarding_completed
     
     # Extract patterns from onboarding
     if 'work_style' in responses:
@@ -2206,53 +2580,60 @@ Provide a concise summary focusing on:
 
 def generate_ai_summary(user, ai_memory) -> str:
     """
-    Generate a friendly AI-powered summary of user's productivity patterns and insights.
+    Generate a motivational, personalized message based on today's tasks and user preferences.
     """
     try:
-        # Gather user's task statistics
-        tasks = Task.objects.filter(user=user)
-        completed_tasks = tasks.filter(status='completed')
-        total_tasks = tasks.count()
-        completed_count = completed_tasks.count()
+        from datetime import date
         
-        # Calculate accuracy metrics
-        feedbacks = TaskFeedback.objects.filter(task__user=user)
-        accuracy_data = []
-        for fb in feedbacks:
-            if fb.actual_duration and fb.estimated_duration:
-                accuracy = (fb.estimated_duration / fb.actual_duration) * 100
-                accuracy_data.append(min(accuracy, 200))  # Cap at 200%
+        # Get today's date
+        today = date.today()
         
-        avg_accuracy = sum(accuracy_data) / len(accuracy_data) if accuracy_data else None
+        # Get today's tasks (scheduled for today or unscheduled active tasks)
+        todays_tasks_query = Task.objects.filter(
+            user=user,
+            status__in=['pending', 'in_progress']
+        ).filter(
+            models.Q(scheduled_date=today) | models.Q(scheduled_date__isnull=True)
+        )
         
-        # Get velocity factor from performance_metrics
-        velocity_factor = ai_memory.performance_metrics.get('velocity_factor', 1.0) if ai_memory.performance_metrics else 1.0
+        # Get high priority tasks count BEFORE slicing
+        high_priority = todays_tasks_query.filter(priority='high').count()
+        
+        # Now slice for task list (must be done AFTER filtering)
+        todays_tasks = todays_tasks_query[:5]
+        
+        completed_today = Task.objects.filter(
+            user=user,
+            status='done',
+            completed_at__date=today
+        ).count()
+        
+        # Get user preferences from onboarding
+        onboarding_info = ai_memory.onboarding_data if ai_memory.onboarding_data else {}
+        work_style = onboarding_info.get('work_style', '')
+        biggest_challenge = onboarding_info.get('biggest_challenge', '')
+        
+        # Build task list for context
+        task_titles = [t.title for t in todays_tasks]
+        task_list_str = ", ".join(task_titles[:3]) if task_titles else "No tasks yet"
         
         # Build context for Claude
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         
-        onboarding_info = ai_memory.onboarding_data if ai_memory.onboarding_data else {}
-        task_cats = ai_memory.task_categories if ai_memory.task_categories else {}
-        
-        # Create clean, ASCII-safe strings
-        onboarding_str = str(onboarding_info)[:100].encode('ascii', 'ignore').decode('ascii')
-        task_cats_str = str(task_cats)[:100].encode('ascii', 'ignore').decode('ascii')
-        
-        prompt = f"""Generate a friendly 2-3 sentence productivity summary for this user.
+        prompt = f"""Generate a SHORT motivational message (1-2 sentences max, under 50 words) for this user starting their day.
 
-Stats:
-- Tasks: {total_tasks} total, {completed_count} done ({(completed_count/total_tasks*100) if total_tasks > 0 else 0:.0f}%)
-- Accuracy: {f"{avg_accuracy:.0f}%" if avg_accuracy else "Learning"}
-- Speed: {f"{velocity_factor:.2f}x" if velocity_factor != 1.0 else "On pace"}
-- Categories: {task_cats_str if task_cats else "None yet"}
-- Onboarding: {onboarding_str if onboarding_info else "Not completed"}
+Today's context:
+- Tasks on deck: {task_list_str}
+- High priority items: {high_priority}
+- Completed today: {completed_today}
+- Work style: {work_style[:50] if work_style else 'Unknown'}
+- Challenge: {biggest_challenge[:50] if biggest_challenge else 'Unknown'}
 
-Create positive, personal summary. Focus on strengths and patterns. Under 60 words. Use only ASCII.
-Start with "You" and be encouraging."""
+Be encouraging and reference their tasks or preferences if relevant. Keep it casual, friendly, and motivating. Use only ASCII characters. Start with something upbeat."""
         
         message = client.messages.create(
             model="claude-3-haiku-20240307",
-            max_tokens=256,
+            max_tokens=128,
             messages=[{"role": "user", "content": prompt}]
         )
         
@@ -2264,10 +2645,17 @@ Start with "You" and be encouraging."""
         print(f"[GENERATE AI SUMMARY ERROR] {str(e)}")
         import traceback
         print(traceback.format_exc())
-        # Fallback - provide basic message based on task count
-        if total_tasks > 0:
-            return f"You've created {total_tasks} tasks so far! Keep using Clarity to track patterns and improve your time awareness."
-        return "Welcome to Clarity! Start adding tasks and I'll learn your patterns to provide personalized insights."
+        # Fallback - provide motivational message
+        from datetime import date
+        today = date.today()
+        completed_today = Task.objects.filter(user=user, status='done', completed_at__date=today).count()
+        pending_today = Task.objects.filter(user=user, status__in=['pending', 'in_progress']).count()
+        
+        if completed_today > 0:
+            return f"Great start! You've completed {completed_today} task{'s' if completed_today > 1 else ''} today. Keep up the momentum!"
+        elif pending_today > 0:
+            return f"You've got {pending_today} task{'s' if pending_today > 1 else ''} ready to tackle. Let's make today productive!"
+        return "Ready to make today count? Add your first task and let's get started!"
 
 
 # ============================================================================

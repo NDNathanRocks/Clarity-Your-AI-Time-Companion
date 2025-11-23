@@ -63,6 +63,7 @@ class Task(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     priority = models.CharField(max_length=10, choices=PRIORITY_CHOICES, default='medium')
     location = models.CharField(max_length=500, blank=True, null=True)
+    order = models.IntegerField(default=0)  # For ordering subtasks
     
     # Scheduling fields
     scheduled_date = models.DateField(blank=True, null=True)
